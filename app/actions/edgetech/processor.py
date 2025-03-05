@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import pydantic
 
@@ -12,7 +12,11 @@ logger = logging.getLogger(__name__)
 
 class EdgetTechProcessor:
     def __init__(
-        self, data: List[dict], er_token: str, er_url: str, filters: dict = None
+        self,
+        data: List[Buoy],
+        er_token: str,
+        er_url: str,
+        filters: Optional[dict] = None,
     ):
         """
         Initialize an EdgetTechProcessor instance.
@@ -31,7 +35,8 @@ class EdgetTechProcessor:
         self._er_client = BuoyClient(er_token, er_url)
         self._filters = filters or self._get_default_filters()
         self._prefix = "edgetech_"
-    def _get_default_filters(self) -> Dict[str, any]:
+
+    def _get_default_filters(self) -> Dict[str, Any]:
         """
         Generate default filter criteria for processing buoy data.
 
@@ -232,6 +237,11 @@ class EdgetTechProcessor:
             buoy_state = buoy_states[serial_number]
             primary_subject_name = f"{self._prefix}{serial_number}_A"
             er_subject = er_subject_mapping.get(primary_subject_name)
+            if er_subject is None:
+                logger.warning(
+                    f"Primary ER subject not found for buoy {serial_number}. Skipping update."
+                )
+                continue
             if self._are_equivalent(er_subject, buoy_state):
                 # No-op: data is already up to date.
                 noop_buoys.add(serial_number)

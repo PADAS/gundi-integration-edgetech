@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 
@@ -16,7 +16,7 @@ class BuoyClient:
             "Authorization": f"Bearer {self.er_token}",
         }
 
-    async def get_er_subjects(self, start_datetime: str = None) -> List:
+    async def get_er_subjects(self, start_datetime: Optional[str] = None) -> List:
         query_params = {
             "include_details": "true",
             "include_inactive": "true",

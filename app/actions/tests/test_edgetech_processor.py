@@ -94,7 +94,7 @@ async def test_process_noop_when_er_subject_equivalent():
 
     processor = EdgetTechProcessor(data, er_token="dummy", er_url="dummy_url")
     # Create a dummy ER subject that exactly matches the buoy record.
-    dummy_er_subject = DummyERSubject("edgetech_B1", True, [-70.0, 40.0])
+    dummy_er_subject = DummyERSubject("edgetech_B1_A", True, [-70.0, 40.0])
     processor._er_client.get_er_subjects = AsyncMock(return_value=[dummy_er_subject])
 
     observations = await processor.process()
@@ -114,7 +114,7 @@ async def test_process_updates_when_er_subject_not_equivalent():
 
     processor = EdgetTechProcessor(data, er_token="dummy", er_url="dummy_url")
     # Create a dummy ER subject with different coordinates.
-    dummy_er_subject = DummyERSubject("edgetech_B1", True, [-70.1, 40.1])
+    dummy_er_subject = DummyERSubject("edgetech_B1_A", True, [-70.1, 40.1])
     processor._er_client.get_er_subjects = AsyncMock(return_value=[dummy_er_subject])
 
     observations = await processor.process()
