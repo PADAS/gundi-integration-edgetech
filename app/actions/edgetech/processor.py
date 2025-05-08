@@ -177,10 +177,11 @@ class EdgeTechProcessor:
                 try:
                     new_obs, last_known_position, last_known_end_position = (
                         buoy_record.create_observations(
-                            self._prefix,
-                            None,
-                            last_known_position,
-                            last_known_end_position,
+                            prefix=self._prefix,
+                            subject_status=None,
+                            last_know_position_previous_states=last_known_position,
+                            last_know_end_position_previous_states=last_known_end_position,
+                            was_part_of_trawl=None,
                         )
                     )
                     observations.extend(new_obs)
@@ -206,7 +207,7 @@ class EdgeTechProcessor:
         for serial_number in update_buoys:
             buoy_records = buoy_states_by_serial_number[serial_number]
             primary_subject_name = f"{self._prefix}{serial_number}_A"
-            er_subject: ObservationSubject = er_subject_mapping.get(
+            er_subject: Optional[ObservationSubject] = er_subject_mapping.get(
                 primary_subject_name
             )
             secondary_subject_name = f"{self._prefix}{serial_number}_B"
@@ -226,10 +227,10 @@ class EdgeTechProcessor:
                     new_obs, last_known_position, last_known_end_position = (
                         buoy_record.create_observations(
                             prefix=self._prefix,
-                            subject_status=er_subject.last_position_date,
-                            last_observation_timestamp=last_known_position,
+                            subject_status=er_subject.is_active,
+                            last_observation_timestamp=er_subject.last_position_date,
                             last_know_position_previous_states=last_known_end_position,
-                            last_know_end_position_previous_states=was_part_of_trawl,
+                            last_know_end_position_previous_states=last_known_position,
                             was_part_of_trawl=was_part_of_trawl,
                         )
                     )

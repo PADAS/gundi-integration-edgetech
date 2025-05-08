@@ -137,8 +137,8 @@ class Buoy(pydantic.BaseModel):
         start_lon: float,
         end_lat: Optional[float],
         end_lon: Optional[float],
-        subject_status: bool,
-        was_part_of_trawl: bool = False,
+        subject_status: Optional[bool] = None,
+        was_part_of_trawl: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         Return one or two observations for deployment or retrieval events,
@@ -223,7 +223,7 @@ class Buoy(pydantic.BaseModel):
     def generate_observations_from_change_records(
         self,
         prefix: str,
-        subject_status: bool,
+        subject_status: Optional[bool],
         last_observation_timestamp: Optional[datetime] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[GeoLocation], Optional[GeoLocation]]:
         """
@@ -315,11 +315,11 @@ class Buoy(pydantic.BaseModel):
     def create_observations(
         self,
         prefix: str,
-        subject_status: bool,
+        subject_status: Optional[bool] = None,
         last_observation_timestamp: Optional[datetime] = None,
         last_know_position_previous_states: Optional[GeoLocation] = None,
         last_know_end_position_previous_states: Optional[GeoLocation] = None,
-        was_part_of_trawl: bool = False,
+        was_part_of_trawl: Optional[bool] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[GeoLocation], Optional[GeoLocation]]:
         """
         Return observations from the current state or from changeRecords if available.
