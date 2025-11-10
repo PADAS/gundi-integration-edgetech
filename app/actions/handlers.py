@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -13,7 +14,6 @@ from app.actions.edgetech.exceptions import InvalidCredentials
 from app.actions.edgetech.processor import EdgeTechProcessor
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger, log_action_activity
-from app.services.gundi import send_observations_to_gundi
 from app.services.utils import find_config_for_action
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ async def process_destination(
 ) -> None:
     """
     Process a single destination: retrieve credentials, run the EdgeTech processor,
-    send observations in batches, and log the activity.
+    convert observations to gear format, and send to Buoy API.
 
     :param gundi_client: Instance of GundiClient.
     :param integration: Integration object.
@@ -81,20 +81,20 @@ async def process_destination(
         filters = {"start_datetime": start_datetime}
         
     processor = EdgeTechProcessor(data, er_destination_token, er_destination_url, filters=filters)
-    observations = await processor.process()
+    gear_payloads = await processor.process()
 
-    for batch in generate_batches(observations):
-        result = await send_observations_to_gundi(
-            observations=batch, integration_id=str(integration.id)
-        )
-        logger.info(f"Sent {len(batch)} observations to Gundi: {result}")
+    # Send gear payloads directly to Buoy API
+    for payload in gear_payloads:
+        result = await processor.send_gear_to_buoy_api(payload)
+        logger.info(f"Sent gear set to Buoy API: {result}")
+    
     await log_action_activity(
         integration_id=integration.id,
         action_id="pull_edgetech",
         level=LogLevel.INFO,
-        title="Pulled data from EdgeTech API",
+        title="Pulled data from EdgeTech API and sent to Buoy API",
     )
-    return len(observations)
+    return len(gear_payloads)
 
 
 # --- Main Handler Functions ---
@@ -153,16 +153,16 @@ async def action_pull_edgetech_observations(
         minutes=action_config.minutes_to_sync
     )
     data = await edgetech_client.download_data(start_datetime=start_datetime)
-
+    data = [item for item in data if item.serialNumber == "88CE99D39E"]
     destination_result = {}
     for destination in connection_details.destinations:
-        observations = await process_destination(
+        gear_payloads_count = await process_destination(
             gundi_client, integration, data, destination, start_datetime
         )
         destination_key = f"{destination.id}_{destination.name}"
         destination_result[destination_key] = {
             "records_extracted": len(data),
-            "observations_sent": observations,
+            "gear_payloads_sent": gear_payloads_count,
         }
 
     return destination_result
