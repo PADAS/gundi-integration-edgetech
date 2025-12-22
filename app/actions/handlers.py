@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -99,7 +100,7 @@ async def process_destination(
             failure_count += 1
             error_info = result.get("error") or result.get("response", "Unknown error")
             logger.error(
-                f"Failed to send gear set {idx + 1}/{len(gear_payloads)} to Buoy API: {error_info}"
+                f"Failed to send gear set {idx + 1}/{len(gear_payloads)} with payload \"{json.dumps(payload, default=str)}\" to Buoy API: {error_info}"
             )
             failed_payloads.append({"index": idx, "error": error_info})
     
@@ -160,14 +161,27 @@ async def action_pull_edgetech_observations(
     integration: Integration, action_config: EdgeTechConfiguration
 ):
     """
-    Pull observations from EdgeTech and send them to Gundi.
+    Pull observations from EdgeTech and send them to EarthRanger via the Buoy API.
 
-    Retrieves connection details and authentication info from the integration,
-    downloads data from EdgeTech, and for each destination, processes the data
-    and sends observations in batches.
+    This action retrieves buoy data from EdgeTech within a configured time window and
+    processes it to generate gear payloads for EarthRanger. The processor determines
+    which gears need to be deployed, updated, or hauled based on explicit status flags
+    from EdgeTech (isDeleted, isDeployed) rather than inferring state from data absence.
+
+    Key behaviors:
+    - Only processes buoys present in the current sync window
+    - Haul events are generated only when EdgeTech explicitly marks a buoy as deleted or not deployed
+    - Absence of a buoy from the sync window does NOT trigger a haul event
+    - Location changes and status updates are tracked for existing gears
+
+    Args:
+        integration: The integration configuration
+        action_config: Action-specific configuration including sync window duration
+
+    Returns:
+        Dictionary with processing results per destination including counts of extracted records
+        and successful/failed gear payloads.
     """
-    # Overwrite minutes_to_sync to ensure we will pull 90 days of data each time.
-    action_config.minutes_to_sync = 90 * 24 * 60  # 90 days in minutes
     gundi_client = GundiClient()
     connection_details = await gundi_client.get_connection_details(integration.id)
     # Get the primary auth config from the integration.

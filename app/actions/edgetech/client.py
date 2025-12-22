@@ -162,7 +162,7 @@ class EdgeTechClient:
             dump_url = f"{self._pull_config.api_base_url}{dump_location}"
 
             for attempt in range(self._pull_config.num_get_retry):
-                logger.debug(
+                logger.info(
                     f"Get Dump Attempt {attempt + 1}/{self._pull_config.num_get_retry}"
                 )
                 async with session.get(
@@ -171,7 +171,7 @@ class EdgeTechClient:
                     if get_response.status == 200:
                         await asyncio.sleep(1)
                     elif get_response.status == 303:
-                        logger.debug("Success - downloading")
+                        logger.info("Success - downloading")
 
                         # Download the file
                         download_url = get_response.headers.get("Location")

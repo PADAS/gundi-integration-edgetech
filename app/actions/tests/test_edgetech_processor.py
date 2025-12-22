@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -112,6 +112,34 @@ def no_location_buoy_record():
     }
 
 
+@pytest.fixture
+def hauled_buoy_no_recovery_location():
+    """Create a hauled buoy record without recovery location (the bug scenario)."""
+    return {
+        "serialNumber": "HAUL123",
+        "userId": "user123",
+        "currentState": {
+            "etag": "hauled_etag",
+            "isDeleted": False,
+            "serialNumber": "HAUL123",
+            "releaseCommand": "release123",
+            "statusCommand": "status123",
+            "idCommand": "id123",
+            "isNfcTag": False,
+            "latDeg": 40.7128,  # Has deployed location
+            "lonDeg": -74.0060,
+            "recoveredLatDeg": None,  # No recovery location
+            "recoveredLonDeg": None,
+            "dateRecovered": "2023-01-02T12:00:00.000Z",  # But has recovery date
+            "modelNumber": "Model123",
+            "isDeployed": False,  # Not deployed anymore
+            "dateDeployed": "2023-01-01T00:00:00.000Z",
+            "lastUpdated": "2023-01-02T12:00:00.000Z",
+        },
+        "changeRecords": [],
+    }
+
+
 class TestEdgeTechProcessor:
     """Test class for EdgeTechProcessor."""
 
@@ -124,7 +152,7 @@ class TestEdgeTechProcessor:
         assert isinstance(filters["start_datetime"], datetime)
 
     def test_should_skip_buoy_deleted(self, deleted_buoy_record):
-        """Test that deleted buoys are skipped."""
+        """Test that deleted buoys are NOT skipped (needed for haul detection)."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
 
         # Create a proper Buoy object
@@ -132,21 +160,21 @@ class TestEdgeTechProcessor:
 
         should_skip, reason = processor._should_skip_buoy(buoy)
 
-        assert should_skip is True
-        assert "deleted buoy record" in reason
-        assert "DEL123" in reason
+        # Deleted buoys should NOT be skipped - we need them to detect haul events
+        assert should_skip is False
+        assert reason is None
 
     def test_should_skip_buoy_not_deployed(self, non_deployed_buoy_record):
-        """Test that non-deployed buoys are skipped."""
+        """Test that non-deployed buoys are NOT skipped (needed for haul detection)."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
 
         buoy = Buoy.parse_obj(non_deployed_buoy_record)
 
         should_skip, reason = processor._should_skip_buoy(buoy)
 
-        assert should_skip is True
-        assert "not deployed" in reason
-        assert "NDEP123" in reason
+        # Non-deployed buoys should NOT be skipped - we need them to detect haul events
+        assert should_skip is False
+        assert reason is None
 
     def test_should_skip_buoy_no_location(self, no_location_buoy_record):
         """Test that buoys with no location are skipped."""
@@ -171,6 +199,132 @@ class TestEdgeTechProcessor:
         assert should_skip is False
         assert reason is None
 
+    def test_should_not_skip_hauled_buoy_without_recovery_location(self, hauled_buoy_no_recovery_location):
+        """Test that hauled buoys without recovery location are NOT skipped (bug fix)."""
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        buoy = Buoy.parse_obj(hauled_buoy_no_recovery_location)
+
+        should_skip, reason = processor._should_skip_buoy(buoy)
+
+        # This is the key fix - hauled buoys should NOT be skipped even without recovery location
+        assert should_skip is False
+        assert reason is None
+
+    def test_is_hauled_or_recovered(self, hauled_buoy_no_recovery_location, deleted_buoy_record, non_deployed_buoy_record):
+        """Test the _is_hauled_or_recovered helper method."""
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        # Test with hauled buoy (has dateRecovered)
+        hauled_buoy = Buoy.parse_obj(hauled_buoy_no_recovery_location)
+        assert processor._is_hauled_or_recovered(hauled_buoy) is True
+
+        # Test with deleted buoy
+        deleted_buoy = Buoy.parse_obj(deleted_buoy_record)
+        assert processor._is_hauled_or_recovered(deleted_buoy) is True
+
+        # Test with non-deployed buoy
+        non_deployed_buoy = Buoy.parse_obj(non_deployed_buoy_record)
+        assert processor._is_hauled_or_recovered(non_deployed_buoy) is True
+
+    def test_create_haul_payload_without_recovery_location(self, hauled_buoy_no_recovery_location):
+        """Test that haul payload uses fallback location when recovery location is not available."""
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        # Create mock ER gear with deployed location
+        mock_device = BuoyDevice(
+            device_id="source_id_123",
+            mfr_device_id="HAUL123_hashed_user_A",
+            label="Test Device",
+            location=DeviceLocation(latitude=40.7128, longitude=-74.0060),  # Last known deployed location
+            last_updated=datetime.now(timezone.utc),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR789",
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=1),
+            devices=[mock_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        # Create haul payload with EdgeTech buoy that has no recovery location
+        edgetech_buoy = Buoy.parse_obj(hauled_buoy_no_recovery_location)
+        payload = processor._create_haul_payload(er_gear=mock_gear, edgetech_buoy=edgetech_buoy)
+
+        # Verify payload structure
+        assert payload["set_id"] == "GEAR789"
+        assert payload["deployment_type"] == "ropeless"
+        assert len(payload["devices"]) == 1
+
+        # Verify device uses fallback location (from ER gear, not recovery location)
+        device = payload["devices"][0]
+        assert device["device_status"] == "hauled"
+        assert device["location"]["latitude"] == 40.7128
+        assert device["location"]["longitude"] == -74.0060
+
+    def test_create_haul_payload_with_recovery_location(self):
+        """Test that haul payload uses recovery location when available."""
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        # Create EdgeTech buoy with recovery location
+        hauled_buoy_with_recovery = {
+            "serialNumber": "HAUL456",
+            "userId": "user123",
+            "currentState": {
+                "etag": "hauled_etag",
+                "isDeleted": False,
+                "serialNumber": "HAUL456",
+                "releaseCommand": "release123",
+                "statusCommand": "status123",
+                "idCommand": "id123",
+                "isNfcTag": False,
+                "latDeg": 40.7128,  # Deployed location
+                "lonDeg": -74.0060,
+                "recoveredLatDeg": 41.0,  # Recovery location (different)
+                "recoveredLonDeg": -73.0,
+                "dateRecovered": "2023-01-02T12:00:00.000Z",
+                "modelNumber": "Model123",
+                "isDeployed": False,
+                "dateDeployed": "2023-01-01T00:00:00.000Z",
+                "lastUpdated": "2023-01-02T12:00:00.000Z",
+            },
+            "changeRecords": [],
+        }
+
+        # Create mock ER gear
+        mock_device = BuoyDevice(
+            device_id="source_id_456",
+            mfr_device_id="HAUL456_hashed_user_A",
+            label="Test Device",
+            location=DeviceLocation(latitude=40.7128, longitude=-74.0060),
+            last_updated=datetime.now(timezone.utc),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR999",
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=1),
+            devices=[mock_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        edgetech_buoy = Buoy.parse_obj(hauled_buoy_with_recovery)
+        payload = processor._create_haul_payload(er_gear=mock_gear, edgetech_buoy=edgetech_buoy)
+
+        # Verify device uses recovery location (not deployed location)
+        device = payload["devices"][0]
+        assert device["device_status"] == "hauled"
+        assert device["location"]["latitude"] == 41.0
+        assert device["location"]["longitude"] == -73.0
+
+
     @pytest.mark.asyncio
     async def test_filter_edgetech_buoys_data_filters_out_invalid(
         self,
@@ -180,7 +334,7 @@ class TestEdgeTechProcessor:
         no_location_buoy_record,
         a_new_edgetech_trawl_record,
     ):
-        """Test that _filter_edgetech_buoys_data correctly filters out invalid records."""
+        """Test that _filter_edgetech_buoys_data keeps deleted/non-deployed but filters no-location records."""
         data = [
             deleted_buoy_record,
             non_deployed_buoy_record,
@@ -194,12 +348,17 @@ class TestEdgeTechProcessor:
         with caplog.at_level(logging.WARNING):
             filtered_data = processor._filter_edgetech_buoys_data(processor._data)
 
-            # Should only have one valid record
-            assert len(filtered_data) == 1
-            assert filtered_data[0].serialNumber == "8899CEDAAA"
+            # Should have 3 valid records (keeps deleted and non-deployed for haul detection)
+            # Only filters out the no-location record
+            assert len(filtered_data) == 3
+            serial_numbers = [buoy.serialNumber for buoy in filtered_data]
+            assert "8899CEDAAA" in serial_numbers  # valid deployed
+            assert "DEL123" in serial_numbers      # deleted (kept for haul detection)
+            assert "NDEP123" in serial_numbers     # non-deployed (kept for haul detection)
+            assert "NOLOC123" not in serial_numbers  # no location (filtered out)
 
-            # Should have logged warnings for filtered records
-            assert len(caplog.records) == 3
+            # Should have logged warning only for no-location record
+            assert len(caplog.records) == 1
 
     def test_get_latest_buoy_states(self, a_new_edgetech_trawl_record):
         """Test that _get_latest_buoy_states returns the latest states."""
@@ -303,14 +462,62 @@ class TestEdgeTechProcessor:
         )
 
     @pytest.mark.asyncio
-    async def test_identify_buoys_haul_missing_buoy(self, mocker):
-        """Test that buoys missing from EdgeTech data are identified for hauling."""
+    async def test_identify_buoys_haul_deleted_buoy(self, mocker, a_new_edgetech_trawl_record):
+        """Test that buoys explicitly marked as deleted in EdgeTech are identified for hauling."""
+        # Create a deleted buoy record
+        deleted_record = a_new_edgetech_trawl_record.copy()
+        deleted_record["currentState"] = deleted_record["currentState"].copy()
+        deleted_record["currentState"]["isDeleted"] = True
+        deleted_record["serialNumber"] = "DELETED123"
+        
+        processor = EdgeTechProcessor(data=[deleted_record], er_token="token", er_url="url")
+
+        # Mock existing ER gear that is still deployed
+        mock_device = BuoyDevice(
+            device_id="some-uuid",
+            mfr_device_id="DELETED123_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
+            label="Deleted Device",
+            location=DeviceLocation(latitude=44.0, longitude=-68.0),
+            last_updated=datetime.now(timezone.utc),
+            last_deployed=datetime.now(timezone.utc),
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR456",
+            status="deployed",  # Gear status is "deployed"
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[mock_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {
+            "DELETED123_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A": mock_gear
+        }
+
+        serial_number_to_edgetech_buoy = {
+            "DELETED123/n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW": processor._data[0]
+        }
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert len(to_deploy) == 0
+        assert len(to_haul) == 1
+        assert len(to_update) == 0
+        assert "DELETED123/n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW" in to_haul
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_no_haul_for_missing_buoy(self, mocker):
+        """Test that buoys missing from EdgeTech sync window are NOT identified for hauling."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
 
-        # Mock existing ER gear but no corresponding EdgeTech buoy
+        # Mock existing ER gear but no corresponding EdgeTech buoy (not in sync window)
         mock_device = BuoyDevice(
-            device_id="edgetech_MISSING123_userABC_A",
-            mfr_device_id="edgetech_MISSING123_userABC_A",
+            device_id="some-uuid",
+            mfr_device_id="MISSING123_userABC_A",
             label="Missing Device",
             location=DeviceLocation(latitude=44.0, longitude=-68.0),
             last_updated=datetime.now(timezone.utc),
@@ -327,18 +534,18 @@ class TestEdgeTechProcessor:
             manufacturer="edgetech",
         )
 
-        er_gears_devices_id_to_gear = {"edgetech_MISSING123_userABC_A": mock_gear}
+        er_gears_devices_id_to_gear = {"MISSING123_userABC_A": mock_gear}
 
-        serial_number_to_edgetech_buoy = {}  # No EdgeTech buoys
+        serial_number_to_edgetech_buoy = {}  # No EdgeTech buoys in sync window
 
         to_deploy, to_haul, to_update = await processor._identify_buoys(
             er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
         )
 
+        # Missing from sync window should NOT trigger haul
         assert len(to_deploy) == 0
-        assert len(to_haul) == 1
+        assert len(to_haul) == 0
         assert len(to_update) == 0
-        assert "edgetech_MISSING123_userABC_A" in to_haul
 
     @pytest.mark.asyncio
     async def test_process_with_two_unit_line_missing_end_unit(
@@ -665,16 +872,16 @@ class TestEdgeTechProcessor:
 
         # Manually trigger the scenario by modifying the to_haul set
         async def mock_identify_buoys(er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy):
-            # Return a device that should be hauled but doesn't exist in ER
-            return set(), {"NONEXISTENT_DEVICE"}, set()
+            # Return a buoy serial/user that should be hauled but doesn't exist in ER
+            return set(), {"NONEXISTENT/userABC"}, set()
 
         processor._identify_buoys = mock_identify_buoys
 
         with caplog.at_level(logging.WARNING):
             observations = await processor.process()
 
-        # Should log warning about no ER subject found
-        assert "No ER gear found for device NONEXISTENT_DEVICE" in caplog.text
+        # Should log warning about no ER gear found
+        assert "No ER gear found for buoy NONEXISTENT/userABC" in caplog.text
         assert len(observations) == 0
 
     @pytest.mark.asyncio
@@ -684,8 +891,8 @@ class TestEdgeTechProcessor:
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
         mock_device = BuoyDevice(
-            device_id="edgetech_HAUL123_userABC_A",
-            mfr_device_id="edgetech_HAUL123_userABC_A",
+            device_id="some-uuid",
+            mfr_device_id="HAUL123_userABC_A",
             label="Haul Device",
             location=DeviceLocation(latitude=44.0, longitude=-68.0),
             last_updated=datetime.now(timezone.utc),
@@ -705,8 +912,13 @@ class TestEdgeTechProcessor:
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
         mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(return_value=None)
         processor._er_client = mock_er_client
+
+        # Mock _identify_buoys to return a haul set that will be processed
+        async def mock_identify_buoys(er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy):
+            return set(), {"HAUL123/userABC"}, set()
+
+        processor._identify_buoys = mock_identify_buoys
 
         # Mock _create_haul_payload to raise ValidationError
         def raise_validation_error(*args, **kwargs):
