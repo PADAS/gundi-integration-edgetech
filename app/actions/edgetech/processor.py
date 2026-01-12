@@ -88,6 +88,7 @@ class EdgeTechProcessor:
 
         last_updated = buoy.currentState.lastUpdated
         last_deployed = buoy.currentState.dateDeployed or last_updated
+        deployment_recorded_at = last_deployed or datetime.now(timezone.utc)
         
         # Create devices list
         devices = []
@@ -101,7 +102,8 @@ class EdgeTechProcessor:
             secondary_device_id = f"{buoy.serialNumber}_{hashed_user_id}_B"
             secondary_latitude = buoy.currentState.endLatDeg
             secondary_longitude = buoy.currentState.endLonDeg
-            secondary_last_deployed = buoy.currentState.dateDeployed or last_updated
+            secondary_last_deployed = last_deployed
+            secondary_recorded_at = deployment_recorded_at
             secondary_device_additional_data = json.loads(buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
         elif end_unit_buoy:
@@ -109,14 +111,17 @@ class EdgeTechProcessor:
             secondary_latitude = end_unit_buoy.currentState.latDeg
             secondary_longitude = end_unit_buoy.currentState.lonDeg
             secondary_last_deployed = end_unit_buoy.currentState.dateDeployed or last_updated
+            secondary_recorded_at = secondary_last_deployed or datetime.now(timezone.utc)
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
+        
         
         main_device = {
             "device_id": manufacturer_id_to_source_id.get(main_device_id) or str(uuid4()),
             "mfr_device_id": main_device_id,
             "last_deployed": self._remove_milliseconds(last_deployed).isoformat(),
             "last_updated": self._remove_milliseconds(last_updated).isoformat(),
+            "recorded_at": self._remove_milliseconds(deployment_recorded_at).isoformat(),
             "device_status": device_status,
             "location": {
                 "latitude": buoy.currentState.latDeg,
@@ -137,6 +142,7 @@ class EdgeTechProcessor:
                 "mfr_device_id": secondary_device_id,
                 "last_deployed": self._remove_milliseconds(secondary_last_deployed).isoformat(),
                 "last_updated": self._remove_milliseconds(last_updated).isoformat(),
+                "recorded_at": self._remove_milliseconds(secondary_recorded_at).isoformat(),
                 "device_status": device_status,
                 "location": {
                     "latitude": secondary_latitude,
@@ -190,6 +196,15 @@ class EdgeTechProcessor:
         recovery_lat = None
         recovery_lon = None
         
+        # Determine the recorded_at timestamp for the haul event
+        # Use dateRecovered if available, otherwise use lastUpdated, or current time
+        haul_recorded_at = datetime.now(timezone.utc)
+        if edgetech_buoy:
+            if edgetech_buoy.currentState.dateRecovered:
+                haul_recorded_at = edgetech_buoy.currentState.dateRecovered
+            elif edgetech_buoy.currentState.lastUpdated:
+                haul_recorded_at = edgetech_buoy.currentState.lastUpdated
+        
         if edgetech_buoy and edgetech_buoy.currentState.recoveredLatDeg and edgetech_buoy.currentState.recoveredLonDeg:
             recovery_location_available = True
             recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
@@ -217,6 +232,7 @@ class EdgeTechProcessor:
                 "mfr_device_id": device.mfr_device_id,
                 "last_deployed": device.last_deployed.isoformat() if device.last_deployed else device.last_updated.isoformat(),
                 "last_updated": self._remove_milliseconds(datetime.now(timezone.utc)).isoformat(),
+                "recorded_at": self._remove_milliseconds(haul_recorded_at).isoformat(),
                 "device_status": "hauled",
                 "location": {
                     "latitude": location_lat,
