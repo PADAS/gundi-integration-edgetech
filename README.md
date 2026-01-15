@@ -286,11 +286,15 @@ def has_location(self) -> bool:
 
 ### Deduplication Strategy
 
+Since serial numbers can be duplicated across users, we group by the combination of serial number AND user:
+
 **Step 1: Group by Buoy Identity**
 ```python
 key = f"{serialNumber}/{hashed_user_id}"
-# Example: "ET-12345/a1b2c3d4"
+# Example: "8899CEDAAA/a1b2c3d4"
 ```
+
+This ensures that if two different users have entered the same serial number, they are treated as **separate buoys**.
 
 **Step 2: Select Latest State**
 ```python
@@ -310,21 +314,24 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 
 **1. DEPLOY (New Deployments)**
 - Buoy exists in EdgeTech but **not** in Earth Ranger
-- Checked device IDs:
-  - Primary: `edgetech_{serialNumber}_{hashedUserId}_A`
-  - Standard: `edgetech_{serialNumber}_{hashedUserId}`
-- Action: Create deployment observations
+- Checked device IDs (matched by `mfr_device_id` in ER gears):
+  - Primary: `{serialNumber}_{hashedUserId}_A`
+  - Standard: `{serialNumber}_{hashedUserId}`
+- Action: Create deployment gear payload with new UUID as `set_id`
 
 **2. UPDATE (Location Changes)**
 - Buoy exists in both systems
-- EdgeTech `lastUpdated` > Earth Ranger `last_updated`
-- Location coordinates have changed
-- Action: Create update observations
+- EdgeTech `lastUpdated` > Earth Ranger `last_updated`, OR location changed
+- Buoy still marked as `isDeployed: true` and `isDeleted: false`
+- Action: Create update gear payload using existing ER gear's `set_id`
 
 **3. HAUL (Retrievals)**
-- Buoy exists in Earth Ranger but **not** in EdgeTech filtered data
-- Indicates the buoy was recovered or removed
-- Action: Create retrieval observations
+- Buoy exists in both systems, but EdgeTech **explicitly** marks it as:
+  - `isDeleted: true`, OR
+  - `isDeployed: false`
+- Earth Ranger gear must still show `status: "deployed"`
+- **Important**: Absence from EdgeTech data does NOT trigger a haul
+- Action: Create haul gear payload using existing ER gear's `set_id`
 
 **4. NO-OP (Skip)**
 - Buoy exists in both systems
@@ -334,51 +341,160 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 
 ---
 
-## Observation Mapping
+## Set ID Resolution
 
-### Our Observation Schema
+When processing EdgeTech buoys, the system must determine whether to create a new gear set or update an existing one. This is done by matching against existing EarthRanger gears.
 
-We transform EdgeTech buoy data into standardized observation records:
+### Lookup Process
+
+**Step 1: Fetch Existing ER Gears**
+```python
+er_gears = await er_client.get_er_gears()  # GET /api/v1.0/gear/
+# Filter: manufacturer.lower() == "edgetech"
+```
+
+**Step 2: Build Device ID Mapping**
+```python
+er_gears_devices_id_to_gear = {
+    device.mfr_device_id: gear
+    for gear in er_gears
+    for device in gear.devices
+}
+# Example mapping:
+# "8899CEDAAA_a1b2c3d4_A" -> BuoyGear(id=UUID(...), display_id="...", ...)
+# "8899CEDAAA_a1b2c3d4_B" -> BuoyGear(id=UUID(...), display_id="...", ...)
+```
+
+**Step 3: Match EdgeTech Buoy to ER Gear**
+```python
+# For each EdgeTech buoy, construct lookup keys:
+primary_key = f"{serial_number}_{hashed_user_id}_A"
+standard_key = f"{serial_number}_{hashed_user_id}"
+
+# Look up in mapping (try primary first, then standard)
+er_gear = er_gears_devices_id_to_gear.get(primary_key) \
+       or er_gears_devices_id_to_gear.get(standard_key)
+```
+
+### Set ID Determination
+
+| Scenario | ER Gear Found? | set_id Source |
+|----------|----------------|---------------|
+| **New Deployment** | No | Generate new UUID: `str(uuid4())` |
+| **Update Existing** | Yes | Use ER gear's `id` field (UUID) |
+| **Haul Existing** | Yes | Use ER gear's `display_id` field |
+
+**Example Flow**:
+```
+EdgeTech Buoy:
+  serialNumber: "8899CEDAAA"
+  userId: "634431265e87a0a75163a20b"
+  
+Hashed User ID: a1b2c3d4
+Lookup Key: "8899CEDAAA_a1b2c3d4_A"
+
+Case 1 - Not in ER:
+  → Generate set_id: "550e8400-e29b-41d4-a716-446655440000"
+  → Create new gear set
+
+Case 2 - Found in ER with id="abc-123-def":
+  → Use set_id: "abc-123-def"
+  → Update existing gear set
+```
+
+### Source ID Mapping
+
+For device-level tracking, the system also maintains a mapping from manufacturer device IDs to ER source IDs:
+
+```python
+sources = await er_client.get_sources()  # GET /api/v1.0/sources/
+manufacturer_id_to_source_id = {
+    source["manufacturer_id"]: source["id"]
+    for source in sources
+}
+```
+
+This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones.
+
+---
+
+## Gear Payload Mapping
+
+### Gear Payload Schema
+
+We transform EdgeTech buoy data into gear payloads for the EarthRanger Buoy API (`POST /api/v1.0/gear/`):
 
 ```json
 {
-  "source_name": "<subject_uuid>",
-  "source": "<device_id>",
-  "subject_type": "ropeless_buoy_gearset",
-  "recorded_at": "<iso8601_timestamp>",
-  "source_type": "ropeless_buoy",
-  "location": {
-    "lat": <latitude>,
-    "lon": <longitude>
-  },
-  "additional": {
-    "event_type": "trap_deployed" | "trap_retrieved",
-    "raw": { /* Original EdgeTech data */ }
-  }
+  "set_id": "<uuid>",
+  "owner_id": "<user_email>",
+  "manufacturer_name": "EdgeTech",
+  "deployment_type": "single" | "trawl",
+  "devices_in_set": <number>,
+  "initial_deployment_date": "<iso8601_timestamp>",
+  "devices": [
+    {
+      "device_id": "<uuid>",
+      "mfr_device_id": "<manufacturer_device_id>",
+      "last_deployed": "<iso8601_timestamp>",
+      "last_updated": "<iso8601_timestamp>",
+      "recorded_at": "<iso8601_timestamp>",
+      "device_status": "deployed" | "hauled",
+      "location": {
+        "latitude": <float>,
+        "longitude": <float>
+      },
+      "device_additional_data": { /* Original EdgeTech data */ }
+    }
+  ]
 }
 ```
 
 ### Field Mapping
 
-| Our Field | EdgeTech Source | Notes |
-|-----------|----------------|-------|
-| `source_name` | Generated UUID | Unique subject identifier for the gearset |
-| `source` | Derived | Device ID: `{serialNumber}_{hashedUserId}[_A/B]` |
-| `subject_type` | Static | Always `"ropeless_buoy_gearset"` |
-| `source_type` | Static | Always `"ropeless_buoy"` |
-| `recorded_at` | `currentState.lastUpdated` | Microseconds removed for consistency |
-| `location.lat` | `currentState.latDeg` or `endLatDeg` | Depends on device position |
-| `location.lon` | `currentState.lonDeg` or `endLonDeg` | Depends on device position |
-| `event_type` | Derived | `trap_deployed` or `trap_retrieved` |
-| `raw` | `currentState` | Complete state (minus `changeRecords`) |
+| Gear Payload Field | EdgeTech Source | Notes |
+|-------------------|----------------|-------|
+| `set_id` | Generated or ER lookup | New UUID for deploy, existing ID for update/haul |
+| `owner_id` | `userId` | Original user email from EdgeTech |
+| `manufacturer_name` | Static | Always `"EdgeTech"` |
+| `deployment_type` | Derived | `"single"` (1 device) or `"trawl"` (2 devices) |
+| `devices_in_set` | Derived | Count of devices in the gear set |
+| `initial_deployment_date` | `currentState.dateDeployed` | Only included for new deployments |
+| `device_id` | ER lookup or generated | Existing source ID or new UUID |
+| `mfr_device_id` | Derived | `{serialNumber}_{hashedUserId}[_A/B]` |
+| `last_deployed` | `currentState.dateDeployed` | Falls back to `lastUpdated` |
+| `last_updated` | `currentState.lastUpdated` | Microseconds removed |
+| `recorded_at` | `currentState.dateDeployed` | Timestamp of the event |
+| `device_status` | Derived | `"deployed"` or `"hauled"` |
+| `location.latitude` | `currentState.latDeg` or `endLatDeg` | Depends on device position |
+| `location.longitude` | `currentState.lonDeg` or `endLonDeg` | Depends on device position |
+| `device_additional_data` | `currentState` | Complete state (minus `changeRecords`) |
 
 ### Device ID Generation
 
 Device IDs uniquely identify each tracking device within a buoy system.
 
+#### Why Serial Number Alone Is Not Unique
+
+In EdgeTech's system, `serialNumber` is a user-entered field - fishermen manually input their buoy serial numbers. This means:
+
+1. **Serial numbers are NOT globally unique** - Two different users could enter the same serial number (intentionally or by mistake)
+2. **The true unique key is `serialNumber + userId`** - EdgeTech scopes each buoy record to the user who entered it
+
+**Example from EdgeTech data**:
+```json
+{
+  "serialNumber": "8899CEDAAA",      // User-entered, potentially duplicated
+  "userId": "634431265e87a0a75163a20b",  // EdgeTech account ID, globally unique
+  "currentState": { ... }
+}
+```
+
+To create a globally unique device identifier for EarthRanger, we combine both fields into `mfr_device_id`.
+
 #### User ID Hashing
 
-**Purpose**: Anonymize user identifiers while maintaining uniqueness
+**Purpose**: Anonymize user identifiers while maintaining uniqueness (we don't want to expose raw EdgeTech account IDs)
 
 ```python
 def get_hashed_user_id(user_id: str) -> str:
@@ -397,57 +513,67 @@ def get_hashed_user_id(user_id: str) -> str:
 For standard buoys (not two-unit lines), we create **two devices** representing start and end of the trap line:
 
 ```
-Device A: edgetech_{serialNumber}_{hashedUserId}_A
-Device B: edgetech_{serialNumber}_{hashedUserId}_B
+Device A: {serialNumber}_{hashedUserId}_A
+Device B: {serialNumber}_{hashedUserId}_B
 ```
 
 **Example**:
 ```
-EdgeTech Serial: ET-12345
-User ID: user@example.com
+EdgeTech Data:
+  serialNumber: "8899CEDAAA"
+  userId: "634431265e87a0a75163a20b"
+  
 Hashed User ID: a1b2c3d4
 
-Device A: edgetech_ET-12345_a1b2c3d4_A (start point)
-Device B: edgetech_ET-12345_a1b2c3d4_B (end point)
+Device A: 8899CEDAAA_a1b2c3d4_A (start point - uses latDeg/lonDeg)
+Device B: 8899CEDAAA_a1b2c3d4_B (end point - uses endLatDeg/endLonDeg)
 ```
 
-**Observation Creation**:
-- Both devices share the same `subject_name` (UUID)
+**Gear Payload Notes**:
+- Both devices share the same `set_id`
 - Device A uses `latDeg` / `lonDeg`
 - Device B uses `endLatDeg` / `endLonDeg` (if present)
-- If end coordinates missing, only Device A observation created
+- If end coordinates missing, only Device A is created (deployment_type="single")
 
 #### Two-Unit Line Buoys
 
-For two-unit systems, each physical buoy becomes a separate device:
+For two-unit systems (`isTwoUnitLine: true`), each physical buoy becomes a separate device (no `_A`/`_B` suffix):
 
 ```
-Start Device: edgetech_{startSerialNumber}_{hashedUserId}
-End Device: edgetech_{endSerialNumber}_{hashedUserId}
+Start Device: {startSerialNumber}_{hashedUserId}
+End Device: {endSerialNumber}_{hashedUserId}
 ```
 
 **Example**:
 ```
-Start Buoy Serial: ET-12345
-End Buoy Serial: ET-12346
-User ID: user@example.com
+Start Buoy:
+  serialNumber: "8899CEDAAA"
+  endUnit: "7788BCDEAA"
+  startUnit: null
+  
+End Buoy:
+  serialNumber: "7788BCDEAA"  
+  endUnit: null
+  startUnit: "8899CEDAAA"
+
+userId (both): "634431265e87a0a75163a20b"
 Hashed User ID: a1b2c3d4
 
-Start Device: edgetech_ET-12345_a1b2c3d4
-End Device: edgetech_ET-12346_a1b2c3d4
+Start Device: 8899CEDAAA_a1b2c3d4
+End Device: 7788BCDEAA_a1b2c3d4
 ```
 
-**Observation Creation**:
-- Both devices share the same `subject_name` (UUID)
+**Gear Payload Notes**:
+- Both devices share the same `set_id`
 - Start device uses start buoy's `latDeg` / `lonDeg`
 - End device uses end buoy's `latDeg` / `lonDeg`
-- Processing triggered only by start unit record
+- Processing triggered only by start unit record (end unit records are skipped)
 
-### Event Types
+### Device Status Values
 
-#### trap_deployed
+#### deployed
 
-Created when:
+Set when:
 - New buoy appears in EdgeTech (DEPLOY operation)
 - Buoy location updated in EdgeTech (UPDATE operation)
 
@@ -455,201 +581,249 @@ Created when:
 
 ```json
 {
-  "additional": {
-    "event_type": "trap_deployed",
-    "raw": { /* currentState */ }
-  }
+  "device_status": "deployed"
 }
 ```
 
-#### trap_retrieved
+#### hauled
 
-Created when:
-- Buoy disappears from EdgeTech filtered data (HAUL operation)
-- Buoy no longer meets deployment criteria
+Set when:
+- EdgeTech marks buoy as `isDeleted: true` or `isDeployed: false`
+- Buoy has `dateRecovered` set
 
 **Indicates**: Buoy has been recovered from water
 
 ```json
 {
-  "additional": {
-    "event_type": "trap_retrieved"
-  }
+  "device_status": "hauled"
 }
 ```
 
 ---
 
-## Mapping Examples
+## Gear Payload Examples
 
 ### Example 1: Single-Unit Deployment
 
 **EdgeTech Input**:
 ```json
 {
+  "serialNumber": "8899CEDAAA",
+  "userId": "634431265e87a0a75163a20b",
   "currentState": {
-    "serialNumber": "ET-12345",
+    "serialNumber": "8899CEDAAA",
     "isDeleted": false,
     "isDeployed": true,
-    "lastUpdated": "2025-10-20T10:00:00Z",
-    "latDeg": 42.123456,
-    "lonDeg": -70.654321,
-    "endLatDeg": 42.234567,
-    "endLonDeg": -70.765432,
+    "dateDeployed": "2026-01-11T21:40:16.781Z",
+    "lastUpdated": "2026-01-11T21:40:17.039Z",
+    "latDeg": 44.3141283,
+    "lonDeg": -68.31271,
+    "endLatDeg": 44.31517,
+    "endLonDeg": -68.31224,
     "isTwoUnitLine": false
-  },
-  "serialNumber": "ET-12345",
-  "userId": "user@example.com"
+  }
 }
 ```
 
-**Our Observations** (2 devices):
+**Our Gear Payload**:
 ```json
-[
-  {
-    "source_name": "550e8400-e29b-41d4-a716-446655440000",
-    "source": "edgetech_ET-12345_a1b2c3d4_A",
-    "subject_type": "ropeless_buoy_gearset",
-    "source_type": "ropeless_buoy",
-    "recorded_at": "2025-10-20T10:00:00+00:00",
-    "location": {
-      "lat": 42.123456,
-      "lon": -70.654321
+{
+  "set_id": "550e8400-e29b-41d4-a716-446655440000",
+  "owner_id": "634431265e87a0a75163a20b",
+  "manufacturer_name": "EdgeTech",
+  "deployment_type": "trawl",
+  "devices_in_set": 2,
+  "initial_deployment_date": "2026-01-11T21:40:16",
+  "devices": [
+    {
+      "device_id": "uuid-for-device-a",
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_A",
+      "device_status": "deployed",
+      "last_deployed": "2026-01-11T21:40:16",
+      "last_updated": "2026-01-11T21:40:17",
+      "recorded_at": "2026-01-11T21:40:16",
+      "location": {
+        "latitude": 44.3141283,
+        "longitude": -68.31271
+      }
     },
-    "additional": {
-      "event_type": "trap_deployed",
-      "raw": { /* currentState */ }
+    {
+      "device_id": "uuid-for-device-b",
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_B",
+      "device_status": "deployed",
+      "last_deployed": "2026-01-11T21:40:16",
+      "last_updated": "2026-01-11T21:40:17",
+      "recorded_at": "2026-01-11T21:40:16",
+      "location": {
+        "latitude": 44.31517,
+        "longitude": -68.31224
+      }
     }
-  },
-  {
-    "source_name": "550e8400-e29b-41d4-a716-446655440000",
-    "source": "edgetech_ET-12345_a1b2c3d4_B",
-    "subject_type": "ropeless_buoy_gearset",
-    "source_type": "ropeless_buoy",
-    "recorded_at": "2025-10-20T10:00:00+00:00",
-    "location": {
-      "lat": 42.234567,
-      "lon": -70.765432
-    },
-    "additional": {
-      "event_type": "trap_deployed",
-      "raw": { /* currentState */ }
-    }
-  }
-]
+  ]
+}
 ```
 
 ### Example 2: Two-Unit Deployment
 
-**EdgeTech Input** (Start Unit):
+**EdgeTech Input** (Start Unit - identified by `startUnit: null`):
 ```json
 {
+  "serialNumber": "8899CEDAAA",
+  "userId": "634431265e87a0a75163a20b",
   "currentState": {
-    "serialNumber": "ET-12345",
+    "serialNumber": "8899CEDAAA",
     "isDeleted": false,
     "isDeployed": true,
-    "lastUpdated": "2025-10-20T10:00:00Z",
-    "latDeg": 42.123456,
-    "lonDeg": -70.654321,
+    "dateDeployed": "2026-01-11T21:40:16.781Z",
+    "lastUpdated": "2026-01-11T21:40:17.039Z",
+    "latDeg": 44.3141283,
+    "lonDeg": -68.31271,
     "isTwoUnitLine": true,
-    "endUnit": "ET-12346",
+    "endUnit": "7788BCDEAA",
     "startUnit": null
-  },
-  "serialNumber": "ET-12345",
-  "userId": "user@example.com"
+  }
 }
 ```
 
-**EdgeTech Input** (End Unit):
+**EdgeTech Input** (End Unit - identified by `endUnit: null`):
 ```json
 {
+  "serialNumber": "7788BCDEAA",
+  "userId": "634431265e87a0a75163a20b",
   "currentState": {
-    "serialNumber": "ET-12346",
+    "serialNumber": "7788BCDEAA",
     "isDeleted": false,
     "isDeployed": true,
-    "lastUpdated": "2025-10-20T10:00:00Z",
-    "latDeg": 42.234567,
-    "lonDeg": -70.765432,
+    "dateDeployed": "2026-01-11T21:40:16.781Z",
+    "lastUpdated": "2026-01-11T21:40:17.039Z",
+    "latDeg": 44.31517,
+    "lonDeg": -68.31224,
     "isTwoUnitLine": true,
     "endUnit": null,
-    "startUnit": "ET-12345"
-  },
-  "serialNumber": "ET-12346",
-  "userId": "user@example.com"
+    "startUnit": "8899CEDAAA"
+  }
 }
 ```
 
-**Our Observations** (2 devices from different buoys):
+**Our Gear Payload** (2 devices from different physical buoys):
 ```json
-[
-  {
-    "source_name": "550e8400-e29b-41d4-a716-446655440000",
-    "source": "edgetech_ET-12345_a1b2c3d4",
-    "subject_type": "ropeless_buoy_gearset",
-    "source_type": "ropeless_buoy",
-    "recorded_at": "2025-10-20T10:00:00+00:00",
-    "location": {
-      "lat": 42.123456,
-      "lon": -70.654321
+{
+  "set_id": "550e8400-e29b-41d4-a716-446655440000",
+  "owner_id": "634431265e87a0a75163a20b",
+  "manufacturer_name": "EdgeTech",
+  "deployment_type": "trawl",
+  "devices_in_set": 2,
+  "initial_deployment_date": "2026-01-11T21:40:16",
+  "devices": [
+    {
+      "device_id": "uuid-for-start-device",
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4",
+      "device_status": "deployed",
+      "last_deployed": "2026-01-11T21:40:16",
+      "last_updated": "2026-01-11T21:40:17",
+      "recorded_at": "2026-01-11T21:40:16",
+      "location": {
+        "latitude": 44.3141283,
+        "longitude": -68.31271
+      }
     },
-    "additional": {
-      "event_type": "trap_deployed",
-      "raw": { /* start unit currentState */ }
+    {
+      "device_id": "uuid-for-end-device",
+      "mfr_device_id": "7788BCDEAA_a1b2c3d4",
+      "device_status": "deployed",
+      "last_deployed": "2026-01-11T21:40:16",
+      "last_updated": "2026-01-11T21:40:17",
+      "recorded_at": "2026-01-11T21:40:16",
+      "location": {
+        "latitude": 44.31517,
+        "longitude": -68.31224
+      }
     }
-  },
-  {
-    "source_name": "550e8400-e29b-41d4-a716-446655440000",
-    "source": "edgetech_ET-12346_a1b2c3d4",
-    "subject_type": "ropeless_buoy_gearset",
-    "source_type": "ropeless_buoy",
-    "recorded_at": "2025-10-20T10:00:00+00:00",
-    "location": {
-      "lat": 42.234567,
-      "lon": -70.765432
-    },
-    "additional": {
-      "event_type": "trap_deployed",
-      "raw": { /* end unit currentState */ }
-    }
-  }
-]
+  ]
+}
 ```
+
+**Note**: Two-unit lines use the actual serial numbers of each buoy (no `_A`/`_B` suffix) since each physical unit has its own serial number. Processing is triggered only by the start unit record (`startUnit: null`).
 
 ### Example 3: Buoy Retrieval (Haul)
 
-When a buoy disappears from EdgeTech data, we create retrieval observations using Earth Ranger's existing record:
+When EdgeTech explicitly marks a buoy as `isDeleted: true` or `isDeployed: false`, we create a haul payload using Earth Ranger's existing record.
 
-**Earth Ranger Record**:
+**Trigger Condition** (EdgeTech data showing recovery):
 ```json
 {
-  "device_id": "edgetech_ET-12345_a1b2c3d4_A",
-  "last_updated": "2025-10-19T15:00:00Z",
-  "location": {
-    "latitude": 42.123456,
-    "longitude": -70.654321
+  "serialNumber": "8899CEDAAA",
+  "userId": "634431265e87a0a75163a20b",
+  "currentState": {
+    "serialNumber": "8899CEDAAA",
+    "isDeleted": false,
+    "isDeployed": false,
+    "dateRecovered": "2026-01-11T21:34:58.923Z",
+    "lastUpdated": "2026-01-11T21:35:02.733Z",
+    "recoveredLatDeg": 44.3124035,
+    "recoveredLonDeg": -68.3037248,
+    "recoveredRangeM": 88.382,
+    "latDeg": null,
+    "lonDeg": null
   }
 }
 ```
 
-**Our Observation**:
+**Earth Ranger Existing Gear** (still shows as deployed):
 ```json
 {
-  "source_name": "<existing_display_id>",
-  "source": "edgetech_ET-12345_a1b2c3d4_A",
-  "subject_type": "ropeless_buoy_gearset",
-  "source_type": "ropeless_buoy",
-  "recorded_at": "2025-10-20T10:00:00+00:00",
-  "location": {
-    "lat": 42.123456,
-    "lon": -70.654321
-  },
-  "additional": {
-    "event_type": "trap_retrieved"
-  }
+  "id": "abc-123-def",
+  "display_id": "abc-123-def",
+  "status": "deployed",
+  "devices": [
+    {
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_A",
+      "location": { "latitude": 44.3141283, "longitude": -68.31271 }
+    },
+    {
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_B",
+      "location": { "latitude": 44.31517, "longitude": -68.31224 }
+    }
+  ]
 }
 ```
 
-**Note**: Uses last known location from Earth Ranger, not EdgeTech recovery location
+**Our Haul Payload**:
+```json
+{
+  "set_id": "abc-123-def",
+  "manufacturer_name": "EdgeTech",
+  "deployment_type": "trawl",
+  "devices": [
+    {
+      "device_id": "existing-uuid-a",
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_A",
+      "device_status": "hauled",
+      "recorded_at": "2026-01-11T21:34:58",
+      "location": {
+        "latitude": 44.3124035,
+        "longitude": -68.3037248
+      }
+    },
+    {
+      "device_id": "existing-uuid-b",
+      "mfr_device_id": "8899CEDAAA_a1b2c3d4_B",
+      "device_status": "hauled",
+      "recorded_at": "2026-01-11T21:34:58",
+      "location": {
+        "latitude": 44.3124035,
+        "longitude": -68.3037248
+      }
+    }
+  ]
+}
+```
+
+**Location Priority for Hauls**:
+1. Recovery location from EdgeTech (`recoveredLatDeg`/`recoveredLonDeg`) if available
+2. Fallback to last deployed location from Earth Ranger
+
+**Note**: All devices in the gear set use the same recovery location since there's only one recovery point.
 
 ---
 
@@ -743,27 +917,30 @@ Result: Entire system skipped if either unit missing
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 4. IDENTIFY OPERATIONS                                      │
-│    DEPLOY:  In EdgeTech, not in ER                          │
+│    DEPLOY:  In EdgeTech (deployed), not in ER               │
 │    UPDATE:  In both, EdgeTech newer + location changed      │
-│    HAUL:    In ER, not in EdgeTech                          │
+│    HAUL:    In both, EdgeTech isDeleted/!isDeployed         │
+│    (Absence from EdgeTech does NOT trigger haul)            │
 └────────────────┬────────────────────────────────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 5. GENERATE OBSERVATIONS                                    │
+│ 5. GENERATE GEAR PAYLOADS                                   │
 │    For each operation:                                      │
-│    - Determine device IDs                                   │
+│    - Resolve set_id (new UUID or existing ER ID)            │
+│    - Resolve device_id (new UUID or existing source ID)     │
 │    - Extract locations                                      │
-│    - Set event_type                                         │
-│    - Build observation JSON                                 │
+│    - Set device_status (deployed/hauled)                    │
+│    - Build gear payload JSON                                │
 └────────────────┬────────────────────────────────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 6. SEND TO DESTINATIONS                                     │
-│    - One observation list per destination                   │
+│ 6. SEND TO BUOY API                                         │
+│    - POST /api/v1.0/gear/ for each payload                  │
+│    - Track success/failure counts                           │
 │    - Log activity to Gundi                                  │
-│    - Return counts                                          │
+│    - Return results                                         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -824,9 +1001,10 @@ continue  # Skip entire system, don't fail
 
 **Filtered Buoys**
 ```python
-logger.warning(f"Skipping deleted buoy {serialNumber}. Last updated: {lastUpdated}")
-logger.warning(f"Skipping buoy {serialNumber} that is not deployed.")
-logger.warning(f"Skipping buoy {serialNumber} with no location data.")
+# Buoys without location that aren't in hauled/recovered state
+logger.warning(f"Skipping buoy {serialNumber} with no location data and not hauled/recovered.")
+# Hauled buoys are logged at INFO level (not skipped)
+logger.info(f"Processing hauled/recovered buoy {serialNumber} without recovery location...")
 ```
 
 **Operation Counts**
@@ -836,11 +1014,11 @@ logger.info(f"Buoys to haul: {to_haul}")
 logger.info(f"Buoys to update: {to_update}")
 ```
 
-**Observations Summary**
+**Gear Payloads Summary**
 ```python
 logger.info(
-    f"Sending {len(observations)} observations:\n"
-    f"{json.dumps(observations, indent=4, default=str)}"
+    f"Generated {len(gear_payloads)} gear payload(s):\n"
+    f"{json.dumps(gear_payloads, indent=4, default=str)}"
 )
 ```
 
@@ -873,7 +1051,9 @@ await log_action_activity(
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1.0/gear/` | GET | List existing buoy gears |
+| `/api/v1.0/gear/` | GET | List existing buoy gears (filtered by manufacturer=edgetech) |
+| `/api/v1.0/gear/` | POST | Create or update gear sets |
+| `/api/v1.0/sources/` | GET | List existing sources (for device_id mapping) |
 
 ### Response Codes
 
@@ -888,14 +1068,15 @@ await log_action_activity(
 
 ## Conclusion
 
-This integration provides robust synchronization between EdgeTech's Trap Tracker system and our buoy tracking platform:
+This integration provides robust synchronization between EdgeTech's Trap Tracker system and EarthRanger via the Buoy API:
 
 ✅ **Automated OAuth management** with token refresh  
 ✅ **Efficient database dump** mechanism for bulk data retrieval  
-✅ **Intelligent filtering** to process only active, deployed buoys  
-✅ **Change detection** to minimize redundant updates  
+✅ **Intelligent filtering** to process active and explicitly hauled buoys  
+✅ **Explicit status-based haul detection** (not inferred from absence)  
+✅ **Set ID resolution** to correctly update existing vs create new gear sets  
 ✅ **Support for complex systems** including two-unit lines  
-✅ **Standardized observation format** for downstream processing  
+✅ **Standardized gear payload format** for the Buoy API  
 ✅ **Comprehensive logging** for monitoring and debugging  
 
 The system runs every 3 minutes, maintaining near real-time synchronization while respecting API limits and ensuring data quality.

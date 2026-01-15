@@ -444,6 +444,28 @@ class EdgeTechProcessor:
                     er_last_updated = er_gear.last_updated
                     has_newer_data = edgetech_last_updated > er_last_updated
                     
+                    # Check if recorded_at would be different - ER/Buoy rejects duplicates
+                    # based on device_id + recorded_at unique constraint
+                    edgetech_recorded_at = self._remove_milliseconds(
+                        edgetech_buoy.currentState.dateDeployed or edgetech_last_updated
+                    )
+                    er_device_last_deployed = None
+                    for device in er_gear.devices:
+                        if device.mfr_device_id in (primary_subject_name, standard_subject_name):
+                            er_device_last_deployed = device.last_deployed
+                            break
+                    
+                    # If recorded_at would be the same as what's already in ER, skip update
+                    # to avoid duplicate rejection
+                    if er_device_last_deployed:
+                        er_recorded_at = self._remove_milliseconds(er_device_last_deployed)
+                        if edgetech_recorded_at == er_recorded_at:
+                            logger.info(
+                                f"Buoy {serial_number_user_id} skipped - recorded_at {edgetech_recorded_at} "
+                                f"already exists in ER (would be rejected as duplicate)"
+                            )
+                            continue
+                    
                     if location_changed or has_newer_data:
                         to_update.add(serial_number_user_id)
                         logger.info(
