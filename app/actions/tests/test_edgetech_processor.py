@@ -1065,6 +1065,235 @@ class TestEdgeTechProcessor:
         assert "No change in location for buoy" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_identify_buoys_position_update_not_skipped_same_date_deployed(
+        self, mocker, caplog
+    ):
+        """
+        Test that position updates are NOT skipped when dateDeployed is unchanged but lastUpdated is newer.
+        
+        This is the bug fix test: Previously, position updates were incorrectly skipped because
+        the code used dateDeployed for recorded_at, and dateDeployed doesn't change on position updates.
+        Now we use lastUpdated for updates, so position changes get a new recorded_at timestamp.
+        """
+        # Create EdgeTech buoy with:
+        # - dateDeployed: 22:40:08 (same as ER)
+        # - lastUpdated: 22:42:49 (newer - position changed)
+        # - Location: changed from ER
+        edgetech_buoy_data = {
+            "serialNumber": "88CE99D976",
+            "userId": "63209b6fe870303c76ddebec",
+            "currentState": {
+                "etag": "1768516969654",
+                "isDeleted": False,
+                "serialNumber": "88CE99D976",
+                "releaseCommand": "C8AB8C7476",
+                "statusCommand": "88CE99D976",
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "latDeg": 40.34753333333333,  # NEW position
+                "lonDeg": -71.59648333333334,  # NEW position
+                "endLatDeg": 40.3499481,
+                "endLonDeg": -71.5732852,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-01-15T22:40:08.628Z",  # SAME as ER
+                "lastUpdated": "2026-01-15T22:42:49.654Z",  # NEWER than ER
+            },
+            "changeRecords": [],
+        }
+
+        processor = EdgeTechProcessor(
+            data=[edgetech_buoy_data], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("63209b6fe870303c76ddebec")
+        device_id = f"88CE99D976_{hashed_user_id}_A"
+
+        # Mock existing ER gear with older lastUpdated and DIFFERENT location
+        mock_device = BuoyDevice(
+            device_id=device_id,
+            mfr_device_id=device_id,
+            label="Test Device",
+            location=DeviceLocation(
+                latitude=40.3499686, longitude=-71.573436  # OLD position
+            ),
+            last_updated=datetime(2026, 1, 15, 22, 40, 9, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 1, 15, 22, 40, 8, tzinfo=timezone.utc),  # SAME as EdgeTech
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR123",
+            status="deployed",
+            last_updated=datetime(2026, 1, 15, 22, 40, 9, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {device_id: mock_gear}
+
+        serial_number_to_edgetech_buoy = {
+            f"88CE99D976/{hashed_user_id}": processor._data[0]
+        }
+
+        with caplog.at_level(logging.INFO):
+            to_deploy, to_haul, to_update = await processor._identify_buoys(
+                er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+            )
+
+        # Key assertion: The buoy should be marked for UPDATE, not skipped
+        # Before the fix, this would be 0 because dateDeployed matched last_deployed
+        assert len(to_update) == 1
+        assert f"88CE99D976/{hashed_user_id}" in to_update
+        assert len(to_haul) == 0
+        assert len(to_deploy) == 0
+
+        # Verify the log shows it was marked for update (not skipped as duplicate)
+        assert "marked for update" in caplog.text
+        assert "skipped - recorded_at" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_create_gear_payload_uses_last_updated_for_updates(self):
+        """
+        Test that _create_gear_payload uses lastUpdated (not dateDeployed) for recorded_at 
+        when include_initial_deployment=False (i.e., for updates).
+        
+        This ensures position updates get a unique recorded_at timestamp.
+        """
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        buoy_data = {
+            "serialNumber": "TEST123",
+            "userId": "user123",
+            "currentState": {
+                "etag": "test_etag",
+                "isDeleted": False,
+                "serialNumber": "TEST123",
+                "releaseCommand": "release123",
+                "statusCommand": "status123",
+                "idCommand": "id123",
+                "isNfcTag": False,
+                "latDeg": 40.0,
+                "lonDeg": -70.0,
+                "modelNumber": "Model123",
+                "isDeployed": True,
+                "dateDeployed": "2026-01-15T22:40:08.000Z",  # Deployment time
+                "lastUpdated": "2026-01-15T22:42:49.000Z",   # Position update time (later)
+            },
+            "changeRecords": [],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+
+        # Test for INITIAL deployment (include_initial_deployment=True)
+        payload_initial = await processor._create_gear_payload(
+            buoy=buoy,
+            device_status="deployed",
+            manufacturer_id_to_source_id={},
+            include_initial_deployment=True,
+        )
+
+        # For initial deployment, recorded_at should be dateDeployed
+        assert payload_initial["devices"][0]["recorded_at"] == "2026-01-15T22:40:08+00:00"
+
+        # Test for UPDATE (include_initial_deployment=False)
+        payload_update = await processor._create_gear_payload(
+            buoy=buoy,
+            device_status="deployed",
+            manufacturer_id_to_source_id={},
+            include_initial_deployment=False,
+        )
+
+        # For updates, recorded_at should be lastUpdated (the fix!)
+        assert payload_update["devices"][0]["recorded_at"] == "2026-01-15T22:42:49+00:00"
+
+        # Verify the timestamps are different
+        assert payload_initial["devices"][0]["recorded_at"] != payload_update["devices"][0]["recorded_at"]
+
+    @pytest.mark.asyncio
+    async def test_position_update_end_to_end(self, mocker, caplog):
+        """
+        End-to-end test that verifies position updates are processed correctly.
+        
+        Scenario: A deployed gear has its position updated in EdgeTech, but dateDeployed
+        remains unchanged. The update should be processed and create a payload with
+        the new position and lastUpdated as recorded_at.
+        """
+        # EdgeTech data with position change
+        edgetech_data = {
+            "serialNumber": "POS123",
+            "userId": "user456",
+            "currentState": {
+                "etag": "test_etag",
+                "isDeleted": False,
+                "serialNumber": "POS123",
+                "releaseCommand": "release123",
+                "statusCommand": "status123",
+                "idCommand": "id123",
+                "isNfcTag": False,
+                "latDeg": 41.0,  # NEW position
+                "lonDeg": -71.0,  # NEW position
+                "modelNumber": "Model123",
+                "isDeployed": True,
+                "dateDeployed": "2026-01-15T10:00:00.000Z",  # SAME as ER
+                "lastUpdated": "2026-01-15T12:00:00.000Z",   # NEWER
+            },
+            "changeRecords": [],
+        }
+
+        processor = EdgeTechProcessor(
+            data=[edgetech_data], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user456")
+        device_id = f"POS123_{hashed_user_id}"
+
+        # Existing ER gear with OLD position
+        mock_device = BuoyDevice(
+            device_id=device_id,
+            mfr_device_id=device_id,
+            label="Test Device",
+            location=DeviceLocation(latitude=40.0, longitude=-70.0),  # OLD position
+            last_updated=datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR456",
+            status="deployed",
+            last_updated=datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        mock_er_client = mocker.MagicMock()
+        mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
+        mock_er_client.get_sources = AsyncMock(return_value=[])
+        processor._er_client = mock_er_client
+
+        with caplog.at_level(logging.INFO):
+            payloads = await processor.process()
+
+        # Should generate exactly 1 update payload
+        assert len(payloads) == 1
+
+        payload = payloads[0]
+        device = payload["devices"][0]
+
+        # Verify the new position is in the payload
+        assert device["location"]["latitude"] == 41.0
+        assert device["location"]["longitude"] == -71.0
+
+        # Key assertion: recorded_at should be lastUpdated, not dateDeployed
+        assert device["recorded_at"] == "2026-01-15T12:00:00+00:00"
+
+        # Verify logs show update (not skipped)
+        assert "marked for update" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_process_deploy_end_unit_record_skip_line_258(self, mocker, caplog):
         """Test that line 258 is hit when processing an end unit record with startUnit."""
         # Create a companion buoy that will be found as the "end unit"

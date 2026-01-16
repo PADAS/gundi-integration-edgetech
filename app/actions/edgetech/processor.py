@@ -88,7 +88,12 @@ class EdgeTechProcessor:
 
         last_updated = buoy.currentState.lastUpdated
         last_deployed = buoy.currentState.dateDeployed or last_updated
-        deployment_recorded_at = last_deployed or datetime.now(timezone.utc)
+        # For initial deployments, use dateDeployed as recorded_at
+        # For updates (position changes), use lastUpdated since dateDeployed doesn't change
+        if include_initial_deployment:
+            deployment_recorded_at = last_deployed or datetime.now(timezone.utc)
+        else:
+            deployment_recorded_at = last_updated or datetime.now(timezone.utc)
         
         # Create devices list
         devices = []
@@ -111,7 +116,12 @@ class EdgeTechProcessor:
             secondary_latitude = end_unit_buoy.currentState.latDeg
             secondary_longitude = end_unit_buoy.currentState.lonDeg
             secondary_last_deployed = end_unit_buoy.currentState.dateDeployed or last_updated
-            secondary_recorded_at = secondary_last_deployed or datetime.now(timezone.utc)
+            end_unit_last_updated = end_unit_buoy.currentState.lastUpdated or last_updated
+            # Use same logic as main device for recorded_at
+            if include_initial_deployment:
+                secondary_recorded_at = secondary_last_deployed or datetime.now(timezone.utc)
+            else:
+                secondary_recorded_at = end_unit_last_updated or datetime.now(timezone.utc)
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
         
@@ -446,9 +456,9 @@ class EdgeTechProcessor:
                     
                     # Check if recorded_at would be different - ER/Buoy rejects duplicates
                     # based on device_id + recorded_at unique constraint
-                    edgetech_recorded_at = self._remove_milliseconds(
-                        edgetech_buoy.currentState.dateDeployed or edgetech_last_updated
-                    )
+                    # For updates, use lastUpdated (not dateDeployed) since position changes
+                    # don't update dateDeployed - only re-deployments do
+                    edgetech_recorded_at = self._remove_milliseconds(edgetech_last_updated)
                     er_device_last_deployed = None
                     for device in er_gear.devices:
                         if device.mfr_device_id in (primary_subject_name, standard_subject_name):
