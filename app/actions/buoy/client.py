@@ -31,22 +31,24 @@ class BuoyClient:
                     url, headers=self.headers, params=params
                 ) as response:
                     if response.status != 200:
-                        logger.error(
-                            f"Failed to make request. Status code: {response.status} Body: {await response.text()}"
+                        body = await response.text()
+                        raise RuntimeError(
+                            f"Failed to fetch gear from Buoy Gear API. Status code: {response.status} Body: {body}"
                         )
-                        break
 
                     data = await response.json()
 
                     if "data" not in data:
-                        logger.error("Unexpected response structure")
-                        break
+                        raise RuntimeError(
+                            f"Unexpected response structure from Buoy Gear API: missing 'data' field. Response: {data}"
+                        )
 
                     page_data = data["data"]
 
                     if "results" not in page_data:
-                        logger.error("No results field in response")
-                        break
+                        raise RuntimeError(
+                            f"Unexpected response structure from Buoy Gear API: missing 'results' field. Response: {page_data}"
+                        )
 
                     results = page_data["results"]
 
@@ -55,18 +57,18 @@ class BuoyClient:
                     url = page_data.get("next")
 
         if len(items) == 0:
-            logger.error("No gears found")
+            logger.warning("No gears found in Buoy API")
 
         gears = []
-        try:
-            for item in items:
+        for item in items:
+            try:
                 buoy = BuoyGear.parse_obj(item)
-                if buoy.manufacturer.lower() != "edgetech":
-                    continue
-                buoy.last_updated = buoy.last_updated.astimezone(timezone.utc)
-                gears.append(buoy)
-        except Exception as e:
-            logger.error(f"Error parsing gear items: {e} (item: {json.dumps(item)})")
+            except Exception as e:
+                raise RuntimeError(f"Error parsing gear item: {e} (item: {json.dumps(item)})")
+            if buoy.manufacturer.lower() != "edgetech":
+                continue
+            buoy.last_updated = buoy.last_updated.astimezone(timezone.utc)
+            gears.append(buoy)
 
         return gears
 
