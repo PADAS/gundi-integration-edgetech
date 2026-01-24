@@ -265,8 +265,8 @@ class TestBuoyClient:
         assert len(mock_session.get_calls) == 2
 
     @pytest.mark.asyncio
-    async def test_get_er_gears_http_error(self, mocker, caplog):
-        """Test gear retrieval with HTTP error response."""
+    async def test_get_er_gears_http_error(self, mocker):
+        """Test gear retrieval with HTTP error response raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -280,18 +280,17 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert result == []
-        assert "Failed to make request. Status code: 500" in caplog.text
-        assert "Internal Server Error" in caplog.text
+        assert "Failed to fetch gear from Buoy Gear API" in str(exc_info.value)
+        assert "Status code: 500" in str(exc_info.value)
+        assert "Internal Server Error" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_get_er_gears_missing_data_field(self, mocker, caplog):
-        """Test gear retrieval with response missing 'data' field."""
+    async def test_get_er_gears_missing_data_field(self, mocker):
+        """Test gear retrieval with response missing 'data' field raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -307,17 +306,16 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert result == []
-        assert "Unexpected response structure" in caplog.text
+        assert "Unexpected response structure from Buoy Gear API" in str(exc_info.value)
+        assert "missing 'data' field" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_get_er_gears_missing_results_field(self, mocker, caplog):
-        """Test gear retrieval with response missing 'results' field."""
+    async def test_get_er_gears_missing_results_field(self, mocker):
+        """Test gear retrieval with response missing 'results' field raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -333,17 +331,16 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert result == []
-        assert "No results field in response" in caplog.text
+        assert "Unexpected response structure from Buoy Gear API" in str(exc_info.value)
+        assert "missing 'results' field" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_er_gears_empty_results(self, mocker, caplog):
-        """Test gear retrieval with empty results."""
+        """Test gear retrieval with empty results logs warning but returns empty list."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -360,18 +357,18 @@ class TestBuoyClient:
         mock_client_session.return_value = MockSessionContext(mock_session)
 
         # Act
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             result = await client.get_er_gears()
 
         # Assert
         assert result == []
-        assert "No gears found" in caplog.text
+        assert "No gears found in Buoy API" in caplog.text
 
     @pytest.mark.asyncio
     async def test_get_er_gears_http_error_on_second_page(
-        self, mocker, caplog, sample_paginated_response
+        self, mocker, sample_paginated_response
     ):
-        """Test gear retrieval with HTTP error on second page."""
+        """Test gear retrieval with HTTP error on second page raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -392,21 +389,19 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert len(result) == 1  # Only first page data
-        assert result[0].display_id == "TEST-GEAR-001"
-        assert "Failed to make request. Status code: 404" in caplog.text
-        assert "Not Found" in caplog.text
+        assert "Failed to fetch gear from Buoy Gear API" in str(exc_info.value)
+        assert "Status code: 404" in str(exc_info.value)
+        assert "Not Found" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_er_gears_invalid_data_structure_on_second_page(
-        self, mocker, caplog, sample_paginated_response
+        self, mocker, sample_paginated_response
     ):
-        """Test gear retrieval with invalid data structure on second page."""
+        """Test gear retrieval with invalid data structure on second page raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -427,14 +422,12 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert len(result) == 1  # Only first page data
-        assert result[0].display_id == "TEST-GEAR-001"
-        assert "Unexpected response structure" in caplog.text
+        assert "Unexpected response structure from Buoy Gear API" in str(exc_info.value)
+        assert "missing 'data' field" in str(exc_info.value)
 
     def test_buoy_client_url_construction(self):
         """Test that the URL is constructed correctly."""
@@ -459,8 +452,8 @@ class TestBuoyClient:
         assert client.headers == expected_headers
 
     @pytest.mark.asyncio
-    async def test_get_er_gears_parse_error(self, mocker, caplog):
-        """Test gear retrieval with BuoyGear parsing error."""
+    async def test_get_er_gears_parse_error(self, mocker):
+        """Test gear retrieval with BuoyGear parsing error raises RuntimeError."""
         # Arrange
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
 
@@ -486,12 +479,10 @@ class TestBuoyClient:
         mock_client_session = mocker.patch("aiohttp.ClientSession")
         mock_client_session.return_value = MockSessionContext(mock_session)
 
-        # Act
-        with caplog.at_level(logging.ERROR):
-            result = await client.get_er_gears()
+        # Act & Assert
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears()
 
-        # Assert
-        assert result == []  # Should return empty list when parsing fails
-        assert "Error parsing gear items:" in caplog.text
-        # Verify that the invalid item data is included in the log message
-        assert "invalid-uuid" in caplog.text
+        assert "Error parsing gear item:" in str(exc_info.value)
+        # Verify that the invalid item data is included in the error message
+        assert "invalid-uuid" in str(exc_info.value)
