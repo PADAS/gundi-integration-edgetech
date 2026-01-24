@@ -13,6 +13,36 @@ The integration runs automatically every 3 minutes via a scheduled task and sync
 
 ---
 
+## Development
+### pyjq setup on macos
+```
+brew update
+brew install autoconf automake libtool pkg-config
+```
+
+verify installed:
+```
+which autoreconf
+autoreconf --version
+```
+
+ensure homebrew in path
+```
+echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zshrc
+eval "$(/opt/homebrew/bin/brew shellenv)"
+```
+
+set compile flags
+```
+export CFLAGS="-I/opt/homebrew/include"
+export LDFLAGS="-L/opt/homebrew/lib"
+```
+
+```
+uv pip install pyjq
+```
+
+
 ## EdgeTech API Connection
 
 ### Authentication
