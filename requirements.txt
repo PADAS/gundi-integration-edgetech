@@ -35,6 +35,8 @@ click==8.1.8
     # via
     #   -r requirements-base.in
     #   uvicorn
+coverage==7.13.1
+    # via -r requirements-dev.in
 cryptography==44.0.1
     # via gcloud-aio-auth
 environs==9.5.0
