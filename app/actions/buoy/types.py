@@ -1,15 +1,13 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.actions.edgetech.types import TRAP_RETRIEVED_EVENT
-
 
 class DeviceLocation(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: Optional[float]
+    longitude: Optional[float]
 
 
 class BuoyDevice(BaseModel):
