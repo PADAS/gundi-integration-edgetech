@@ -22,7 +22,7 @@ class BuoyClient:
         self,
         params: Optional[dict] = None,
     ) -> List[BuoyGear]:
-        url = f"{self.er_site}api/v1.0/gear/"
+        url = f"{self.er_site}api/v1.0/gear/?include_empty_location=true"
         items = []
 
         async with aiohttp.ClientSession() as session:

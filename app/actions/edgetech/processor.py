@@ -407,6 +407,7 @@ class EdgeTechProcessor:
         for serial_number_user_id in serial_number_to_edgetech_buoy.keys():
             serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
             primary_subject_name = f"{serial_number}_{hashed_user_id}_A"
+            secondary_subject_name = f"{serial_number}_{hashed_user_id}_B"
             standard_subject_name = f"{serial_number}_{hashed_user_id}"
 
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
@@ -414,7 +415,7 @@ class EdgeTechProcessor:
             # Check if gear exists in ER
             er_gear = er_gears_devices_id_to_gear.get(
                 primary_subject_name
-            ) or er_gears_devices_id_to_gear.get(standard_subject_name)
+            ) or er_gears_devices_id_to_gear.get(standard_subject_name) or er_gears_devices_id_to_gear.get(secondary_subject_name)
 
             if er_gear is None:
                 # Gear doesn't exist in ER - check if it should be deployed
