@@ -185,7 +185,9 @@ class TestBuoyClient:
         # Verify the session.get was called with correct parameters
         assert len(mock_session.get_calls) == 1
         args, kwargs = mock_session.get_calls[0]
-        assert args[0] == "https://example.com/api/v1.0/gear/"
+        assert (
+            args[0] == "https://example.com/api/v1.0/gear/?include_empty_location=true"
+        )
         assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
         assert kwargs["params"] is None
 
@@ -220,7 +222,9 @@ class TestBuoyClient:
         # Verify the correct API call was made with params
         assert len(mock_session.get_calls) == 1
         args, kwargs = mock_session.get_calls[0]
-        assert args[0] == "https://example.com/api/v1.0/gear/"
+        assert (
+            args[0] == "https://example.com/api/v1.0/gear/?include_empty_location=true"
+        )
         assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
         assert kwargs["params"] == params
 
@@ -460,14 +464,14 @@ class TestBuoyClient:
         # Mock response with invalid gear data that will cause parsing to fail
         invalid_gear_data = {
             "id": "invalid-uuid",  # This will cause parsing error
-            "display_id": "TEST-GEAR-001", 
+            "display_id": "TEST-GEAR-001",
             "status": "deployed",
             "last_updated": "invalid-date",  # This will also cause parsing error
             "devices": "not-a-list",  # This should be a list
             "type": "ropeless",
             "manufacturer": "EdgeTech",
         }
-        
+
         response_data = {"data": {"results": [invalid_gear_data], "next": None}}
 
         mock_response = AsyncMock()
