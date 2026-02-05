@@ -14,6 +14,15 @@ The integration runs automatically every 3 minutes via a scheduled task and sync
 ---
 
 ## Development
+
+### Create Python Environment
+
+```bash
+uv venv --python=3.10 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
 ### pyjq setup on macos
 ```
 brew update
@@ -129,13 +138,13 @@ Response Body: GZIP-compressed JSON
 async def download_data(start_datetime: Optional[datetime]) -> List[Buoy]:
     # 1. Get valid token (refresh if needed)
     token = await self.get_token()
-    
+
     # 2. Initiate dump
     # 3. Poll until ready
     # 4. Download GZIP file
     # 5. Decompress and parse JSON
     # 6. Filter by start_datetime if provided
-    
+
     return buoys
 ```
 
@@ -293,13 +302,13 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 def _should_skip_buoy(record: Buoy) -> Tuple[bool, Optional[str]]:
     if record.currentState.isDeleted:
         return True, f"Deleted buoy {record.serialNumber}"
-    
+
     if not record.currentState.isDeployed:
         return True, f"Not deployed {record.serialNumber}"
-    
+
     if not record.has_location:
         return True, f"No location data {record.serialNumber}"
-    
+
     return False, None
 ```
 
@@ -310,7 +319,7 @@ def has_location(self) -> bool:
     has_deployed = (self.latDeg is not None and self.lonDeg is not None)
     has_end = (self.endLatDeg is not None and self.endLonDeg is not None)
     has_recovered = (self.recoveredLatDeg is not None and self.recoveredLonDeg is not None)
-    
+
     return has_deployed or has_end or has_recovered
 ```
 
@@ -419,7 +428,7 @@ er_gear = er_gears_devices_id_to_gear.get(primary_key) \
 EdgeTech Buoy:
   serialNumber: "8899CEDAAA"
   userId: "634431265e87a0a75163a20b"
-  
+
 Hashed User ID: a1b2c3d4
 Lookup Key: "8899CEDAAA_a1b2c3d4_A"
 
@@ -530,11 +539,11 @@ To create a globally unique device identifier for EarthRanger, we combine both f
 def get_hashed_user_id(user_id: str) -> str:
     # Convert to hex
     user_id_hex = user_id.encode("utf-8").hex()
-    
+
     # Hash with Hashids (min length: 8)
     hashids = Hashids(min_length=8)
     hashed = hashids.encode_hex(user_id_hex)
-    
+
     return hashed  # e.g., "a1b2c3d4"
 ```
 
@@ -552,7 +561,7 @@ Device B: {serialNumber}_{hashedUserId}_B
 EdgeTech Data:
   serialNumber: "8899CEDAAA"
   userId: "634431265e87a0a75163a20b"
-  
+
 Hashed User ID: a1b2c3d4
 
 Device A: 8899CEDAAA_a1b2c3d4_A (start point - uses latDeg/lonDeg)
@@ -580,9 +589,9 @@ Start Buoy:
   serialNumber: "8899CEDAAA"
   endUnit: "7788BCDEAA"
   startUnit: null
-  
+
 End Buoy:
-  serialNumber: "7788BCDEAA"  
+  serialNumber: "7788BCDEAA"
   endUnit: null
   startUnit: "8899CEDAAA"
 
@@ -888,7 +897,7 @@ recorded_at = state.lastUpdated.replace(microsecond=0)
 We skip UPDATE operations if location hasn't changed:
 
 ```python
-if (er_device_lat == edgetech_buoy_lat and 
+if (er_device_lat == edgetech_buoy_lat and
     er_device_long == edgetech_buoy_long):
     # No change - skip update
     continue
@@ -1100,13 +1109,13 @@ await log_action_activity(
 
 This integration provides robust synchronization between EdgeTech's Trap Tracker system and EarthRanger via the Buoy API:
 
-✅ **Automated OAuth management** with token refresh  
-✅ **Efficient database dump** mechanism for bulk data retrieval  
-✅ **Intelligent filtering** to process active and explicitly hauled buoys  
-✅ **Explicit status-based haul detection** (not inferred from absence)  
-✅ **Set ID resolution** to correctly update existing vs create new gear sets  
-✅ **Support for complex systems** including two-unit lines  
-✅ **Standardized gear payload format** for the Buoy API  
-✅ **Comprehensive logging** for monitoring and debugging  
+✅ **Automated OAuth management** with token refresh
+✅ **Efficient database dump** mechanism for bulk data retrieval
+✅ **Intelligent filtering** to process active and explicitly hauled buoys
+✅ **Explicit status-based haul detection** (not inferred from absence)
+✅ **Set ID resolution** to correctly update existing vs create new gear sets
+✅ **Support for complex systems** including two-unit lines
+✅ **Standardized gear payload format** for the Buoy API
+✅ **Comprehensive logging** for monitoring and debugging
 
 The system runs every 3 minutes, maintaining near real-time synchronization while respecting API limits and ensuring data quality.
