@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from app.actions.buoy import BuoyClient
-from app.actions.buoy.types import BuoyGear
+from app.actions.buoy.types import BuoyDevice, BuoyGear
 from app.actions.edgetech.types import Buoy
 from app.actions.utils import get_hashed_user_id
 
@@ -65,6 +65,7 @@ class EdgeTechProcessor:
         device_status: str,
         manufacturer_id_to_source_id: Dict[str, str],
         end_unit_buoy: Optional[Buoy] = None,
+        end_unit_device_from_er: Optional[BuoyDevice] = None,
         set_id: Optional[str] = None,
         include_initial_deployment: bool = True,
     ) -> Dict[str, Any]:
@@ -75,7 +76,9 @@ class EdgeTechProcessor:
             buoy: The main Buoy object
             device_status: Status of the device (deployed/hauled)
             manufacturer_id_to_source_id: Mapping of manufacturer_id to source_id for existing sources
-            end_unit_buoy: Optional second buoy for two-unit lines
+            end_unit_buoy: Optional second buoy for two-unit lines (from EdgeTech sync window)
+            end_unit_device_from_er: Optional end-unit device from ER when end_unit_buoy is not
+                in the sync window (e.g. location-only update on start unit); used for updates only.
             set_id: Optional gear set ID (auto-generated if not provided)
             include_initial_deployment: Whether to include initial_deployment_date
 
@@ -130,6 +133,24 @@ class EdgeTechProcessor:
                 )
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
+        elif end_unit_device_from_er:
+            # End unit not in EdgeTech sync window (e.g. location-only update on start unit);
+            # use current state from ER so we can still send the start unit's location update.
+            secondary_device_id = end_unit_device_from_er.mfr_device_id
+            secondary_latitude = end_unit_device_from_er.location.latitude
+            secondary_longitude = end_unit_device_from_er.location.longitude
+            secondary_last_deployed = (
+                end_unit_device_from_er.last_deployed or last_updated
+            )
+            secondary_recorded_at = end_unit_device_from_er.last_updated or last_updated
+            secondary_device_additional_data = {
+                "serialNumber": secondary_device_id.split("_")[0],
+                "lastUpdated": (
+                    end_unit_device_from_er.last_updated.isoformat()
+                    if end_unit_device_from_er.last_updated
+                    else None
+                ),
+            }
 
         main_device = {
             "device_id": manufacturer_id_to_source_id.get(main_device_id)
@@ -697,6 +718,7 @@ class EdgeTechProcessor:
             try:
                 # Get end unit buoy if this is a two-unit line
                 end_unit_buoy = None
+                end_unit_device_from_er = None
                 if edgetech_buoy.currentState.isTwoUnitLine:
                     if edgetech_buoy.currentState.endUnit:
                         end_unit_buoy_key = f"{edgetech_buoy.currentState.endUnit}/{get_hashed_user_id(edgetech_buoy.userId)}"
@@ -705,12 +727,27 @@ class EdgeTechProcessor:
                         )
 
                         if not end_unit_buoy:
-                            logger.warning(
-                                "End unit buoy %s not found for serial number %s, skipping update.",
+                            # End unit not in sync window (e.g. only start unit had location update).
+                            # Use end unit's current state from ER so we can still push the update.
+                            for er_device in er_gear.devices:
+                                if er_device.mfr_device_id not in (
+                                    primary_device_name,
+                                    single_device_name,
+                                ):
+                                    end_unit_device_from_er = er_device
+                                    break
+                            if not end_unit_device_from_er:
+                                logger.warning(
+                                    "End unit buoy %s not found and no end unit device in ER gear for %s, skipping update.",
+                                    edgetech_buoy.currentState.endUnit,
+                                    serial_number_user_id,
+                                )
+                                continue
+                            logger.info(
+                                "End unit %s not in sync window; using current state from ER for update of %s",
                                 edgetech_buoy.currentState.endUnit,
                                 serial_number_user_id,
                             )
-                            continue
 
                     if edgetech_buoy.currentState.startUnit:
                         # This record is for the end unit, skip it
@@ -721,6 +758,7 @@ class EdgeTechProcessor:
                     device_status="deployed",
                     manufacturer_id_to_source_id=manufacturer_id_to_source_id,
                     end_unit_buoy=end_unit_buoy,
+                    end_unit_device_from_er=end_unit_device_from_er,
                     set_id=er_gear.id,
                     include_initial_deployment=False,
                 )
