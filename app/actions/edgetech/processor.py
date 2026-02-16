@@ -729,11 +729,10 @@ class EdgeTechProcessor:
                         if not end_unit_buoy:
                             # End unit not in sync window (e.g. only start unit had location update).
                             # Use end unit's current state from ER so we can still push the update.
+                            # Match by mfr_device_id: same format as when we create the payload.
+                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
                             for er_device in er_gear.devices:
-                                if er_device.mfr_device_id not in (
-                                    primary_device_name,
-                                    single_device_name,
-                                ):
+                                if er_device.mfr_device_id == end_unit_mfr_id:
                                     end_unit_device_from_er = er_device
                                     break
                             if not end_unit_device_from_er:
