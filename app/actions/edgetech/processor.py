@@ -559,6 +559,57 @@ class EdgeTechProcessor:
 
         return to_deploy, to_haul, to_update
 
+    def _get_circular_two_unit_start_keys_to_skip(
+        self, serial_number_to_edgetech_buoy: Dict[str, Buoy]
+    ) -> Set[str]:
+        """
+        Detect circular two-unit line configs: same two devices each configured as
+        start unit with the other as end (e.g. A.endUnit=B and B.endUnit=A). That
+        would create two gearsets for one physical pair. We keep one canonical
+        start (lower serial number) and skip the other.
+
+        Returns:
+            Set of buoy keys (serialNumber/hashedUserId) to skip when processing
+            deployments/updates for two-unit lines.
+        """
+        skip_keys: Set[str] = set()
+        seen_pairs: Set[Tuple[str, str]] = set()  # (min_serial, max_serial) for dedup
+
+        for key, buoy in serial_number_to_edgetech_buoy.items():
+            if not buoy.currentState.isTwoUnitLine or not buoy.currentState.endUnit:
+                continue
+            if buoy.currentState.startUnit:
+                continue  # This is an end-unit record, not a start
+            partner_serial = buoy.currentState.endUnit
+            hashed_user_id = get_hashed_user_id(buoy.userId)
+            partner_key = f"{partner_serial}/{hashed_user_id}"
+            partner = serial_number_to_edgetech_buoy.get(partner_key)
+            if not partner or not partner.currentState.isTwoUnitLine:
+                continue
+            # Circular: partner also has endUnit pointing back to this buoy (so both are "start")
+            if partner.currentState.endUnit != buoy.serialNumber:
+                continue
+            if partner.currentState.startUnit:
+                continue  # Partner is end unit, not start; no conflict
+            pair = tuple(sorted([buoy.serialNumber, partner_serial]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            # Skip the one with the larger serial so we have a single canonical gearset
+            skip_serial = max(buoy.serialNumber, partner_serial)
+            skip_key = f"{skip_serial}/{hashed_user_id}"
+            skip_keys.add(skip_key)
+            logger.warning(
+                "Circular two-unit line detected: devices %s and %s each configured as "
+                "start with the other as end. Skipping duplicate start for %s (canonical lead: %s). "
+                "Only one gearset will be created for this pair.",
+                buoy.serialNumber,
+                partner_serial,
+                skip_serial,
+                min(buoy.serialNumber, partner_serial),
+            )
+        return skip_keys
+
     async def process(self) -> List[Dict[str, Any]]:
         """
         Process buoy data to generate gear payloads for the Buoy API.
@@ -602,6 +653,11 @@ class EdgeTechProcessor:
 
         logger.info(
             f"Processing {len(serial_number_to_edgetech_buoy)} buoys from EdgeTech sync window"
+        )
+
+        # Detect circular two-unit configs (same pair each as start) and skip duplicate
+        circular_two_unit_skip_keys = self._get_circular_two_unit_start_keys_to_skip(
+            serial_number_to_edgetech_buoy
         )
 
         # Fetch all sources once and create a mapping for efficient lookups
@@ -655,6 +711,13 @@ class EdgeTechProcessor:
 
                 if edgetech_buoy.currentState.startUnit:
                     # This record is for the end unit, skip it (will be handled by start unit)
+                    continue
+
+                if serial_number_user_id in circular_two_unit_skip_keys:
+                    logger.warning(
+                        "Skipping deployment for %s (circular two-unit duplicate).",
+                        serial_number_user_id,
+                    )
                     continue
 
                 payload = await self._create_gear_payload(
@@ -751,6 +814,13 @@ class EdgeTechProcessor:
                     if edgetech_buoy.currentState.startUnit:
                         # This record is for the end unit, skip it
                         continue
+
+                if serial_number_user_id in circular_two_unit_skip_keys:
+                    logger.warning(
+                        "Skipping update for %s (circular two-unit duplicate).",
+                        serial_number_user_id,
+                    )
+                    continue
 
                 payload = await self._create_gear_payload(
                     buoy=edgetech_buoy,

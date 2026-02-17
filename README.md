@@ -263,6 +263,7 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 - The start unit (`startUnit: null`) initiates processing
 - The end unit (`endUnit: null`) is skipped (processed as part of start unit)
 - If end unit is missing, the start unit is skipped with a warning
+- **Circular two-unit protection**: If the same two devices are each configured as start with the other as end (e.g. A.endUnit=B and B.endUnit=A), only one gearset is created. The duplicate start is skipped (canonical lead is the device with the smaller serial number), and a warning is logged.
 
 ---
 

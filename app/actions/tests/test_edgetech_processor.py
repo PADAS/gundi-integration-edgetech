@@ -1145,6 +1145,152 @@ class TestEdgeTechProcessor:
         # Should not create observations for the end unit (it's skipped)
 
     @pytest.mark.asyncio
+    async def test_process_circular_two_unit_line_only_one_gear_created(
+        self, mocker, caplog, a_new_edgetech_trawl_record
+    ):
+        """When two devices are each configured as start with the other as end (circular),
+        only one gearset payload is created; the duplicate start is skipped with a warning.
+        """
+        user_id = a_new_edgetech_trawl_record["userId"]
+        # Unit A: lead in one config, endUnit = B
+        record_a = a_new_edgetech_trawl_record.copy()
+        record_a["serialNumber"] = "88CE99D99E"
+        record_a["currentState"] = record_a["currentState"].copy()
+        record_a["currentState"]["serialNumber"] = "88CE99D99E"
+        record_a["currentState"]["isTwoUnitLine"] = True
+        record_a["currentState"]["endUnit"] = "88CE9978B7"
+        record_a["currentState"]["startUnit"] = None
+        record_a["currentState"]["endLatDeg"] = None
+        record_a["currentState"]["endLonDeg"] = None
+        # Unit B: also configured as lead with endUnit = A (circular)
+        record_b = a_new_edgetech_trawl_record.copy()
+        record_b["serialNumber"] = "88CE9978B7"
+        record_b["userId"] = user_id
+        record_b["currentState"] = record_b["currentState"].copy()
+        record_b["currentState"]["serialNumber"] = "88CE9978B7"
+        record_b["currentState"]["latDeg"] = 42.3267312
+        record_b["currentState"]["lonDeg"] = -70.0474376
+        record_b["currentState"]["isTwoUnitLine"] = True
+        record_b["currentState"]["endUnit"] = "88CE99D99E"
+        record_b["currentState"]["startUnit"] = None
+        record_b["currentState"]["endLatDeg"] = None
+        record_b["currentState"]["endLonDeg"] = None
+
+        data = [record_a, record_b]
+        processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
+
+        mock_er_client = mocker.MagicMock()
+        mock_er_client.get_er_gears = AsyncMock(return_value=[])
+        mock_er_client.get_sources = AsyncMock(return_value=[])
+        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
+            return_value=None
+        )
+        processor._er_client = mock_er_client
+
+        with caplog.at_level(logging.WARNING):
+            payloads = await processor.process()
+
+        # Exactly one gear payload (canonical lead); the other start is skipped
+        assert len(payloads) == 1
+        assert "Circular two-unit line detected" in caplog.text
+        assert "88CE99D99E" in caplog.text and "88CE9978B7" in caplog.text
+        # Canonical lead is the smaller serial (88CE9978B7 < 88CE99D99E)
+        gear = payloads[0]
+        device_mfr_ids = [d.get("mfr_device_id") for d in gear.get("devices", [])]
+        assert len(device_mfr_ids) == 2
+        hashed = get_hashed_user_id(user_id)
+        assert f"88CE9978B7_{hashed}" in device_mfr_ids
+        assert f"88CE99D99E_{hashed}" in device_mfr_ids
+
+    @pytest.mark.asyncio
+    async def test_process_circular_two_unit_both_already_in_er_same_gear_single_update(
+        self, mocker, caplog, a_new_edgetech_trawl_record
+    ):
+        """When both devices are already in ER (e.g. Feb 3 gear that later got the
+        circular pair attached), circular skip ensures we send only one update for
+        that gear, not two updates (which could duplicate or confuse the gear).
+        """
+        user_id = a_new_edgetech_trawl_record["userId"]
+        hashed = get_hashed_user_id(user_id)
+        gear_id = uuid4()
+        # Existing gear in ER with both devices (simulating circular attach to Feb 3 gear)
+        older_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        mock_device_a = BuoyDevice(
+            device_id=f"88CE99D99E_{hashed}",
+            mfr_device_id=f"88CE99D99E_{hashed}",
+            label="Lead",
+            location=DeviceLocation(latitude=42.32, longitude=-70.05),
+            last_updated=older_time,
+            last_deployed=older_time,
+        )
+        mock_device_b = BuoyDevice(
+            device_id=f"88CE9978B7_{hashed}",
+            mfr_device_id=f"88CE9978B7_{hashed}",
+            label="End",
+            location=DeviceLocation(latitude=42.32, longitude=-70.04),
+            last_updated=older_time,
+            last_deployed=older_time,
+        )
+        existing_gear = BuoyGear(
+            id=gear_id,
+            display_id="GEAR-FEB3",
+            status="deployed",
+            last_updated=older_time,
+            devices=[mock_device_a, mock_device_b],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+        # EdgeTech: circular two-unit (both as start with other as end)
+        record_a = a_new_edgetech_trawl_record.copy()
+        record_a["serialNumber"] = "88CE99D99E"
+        record_a["currentState"] = record_a["currentState"].copy()
+        record_a["currentState"]["serialNumber"] = "88CE99D99E"
+        record_a["currentState"]["latDeg"] = 42.3246478
+        record_a["currentState"]["lonDeg"] = -70.0545583
+        record_a["currentState"]["lastUpdated"] = "2026-02-14T22:34:54.891Z"
+        record_a["currentState"]["isTwoUnitLine"] = True
+        record_a["currentState"]["endUnit"] = "88CE9978B7"
+        record_a["currentState"]["startUnit"] = None
+        record_a["currentState"]["endLatDeg"] = None
+        record_a["currentState"]["endLonDeg"] = None
+        record_b = a_new_edgetech_trawl_record.copy()
+        record_b["serialNumber"] = "88CE9978B7"
+        record_b["userId"] = user_id
+        record_b["currentState"] = record_b["currentState"].copy()
+        record_b["currentState"]["serialNumber"] = "88CE9978B7"
+        record_b["currentState"]["latDeg"] = 42.3267312
+        record_b["currentState"]["lonDeg"] = -70.0474376
+        record_b["currentState"]["lastUpdated"] = "2026-02-14T22:34:54.975Z"
+        record_b["currentState"]["isTwoUnitLine"] = True
+        record_b["currentState"]["endUnit"] = "88CE99D99E"
+        record_b["currentState"]["startUnit"] = None
+        record_b["currentState"]["endLatDeg"] = None
+        record_b["currentState"]["endLonDeg"] = None
+
+        data = [record_a, record_b]
+        processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
+
+        mock_er_client = mocker.MagicMock()
+        mock_er_client.get_er_gears = AsyncMock(return_value=[existing_gear])
+        mock_er_client.get_sources = AsyncMock(return_value=[])
+        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
+            return_value=None
+        )
+        processor._er_client = mock_er_client
+
+        with caplog.at_level(logging.WARNING):
+            payloads = await processor.process()
+
+        # One update payload for the existing gear (no second update from the other start)
+        assert len(payloads) == 1
+        assert payloads[0].get("set_id") == str(gear_id)
+        assert len(payloads[0].get("devices", [])) == 2
+        assert (
+            "Skipping update for 88CE99D99E" in caplog.text
+            or "circular two-unit duplicate" in caplog.text
+        )
+
+    @pytest.mark.asyncio
     async def test_process_update_no_location_change_exact_coordinates(
         self, mocker, caplog
     ):
