@@ -429,9 +429,11 @@ class EdgeTechProcessor:
         if a haul event should be generated, rather than inferring hauling from absence in the dataset.
 
         Process:
-        - `to_deploy`: Buoys that are deployed in EdgeTech but not yet in ER.
+        - `to_deploy`: Buoys that are deployed in EdgeTech but not yet in ER, or re-deployments
+          (EdgeTech dateDeployed newer than ER gear's deployment: haul existing then deploy new).
         - `to_update`: Buoys that exist in ER and have changes (location, status, or newer data).
-        - `to_haul`: Buoys that are explicitly marked as deleted or not deployed in EdgeTech.
+        - `to_haul`: Buoys that are explicitly marked as deleted or not deployed in EdgeTech, or re-deployments
+          (close existing gear before new deployment).
 
         Args:
             er_gears_devices_id_to_gear (Dict[str, BuoyGear]): Mapping of ER device IDs to gear objects.
@@ -499,7 +501,40 @@ class EdgeTechProcessor:
                             f"Buoy {serial_number_user_id} already hauled in ER, skipping"
                         )
                 else:
-                    # Buoy is still deployed - check if it needs updating
+                    # Buoy is still deployed - check for re-deployment first (new deployment
+                    # with same serials: close previous gear and create new one)
+                    er_gear_deployment_dates = [
+                        d.last_deployed
+                        for d in er_gear.devices
+                        if isinstance(getattr(d, "last_deployed", None), datetime)
+                    ]
+                    er_gear_deployment_date = (
+                        min(er_gear_deployment_dates)
+                        if er_gear_deployment_dates
+                        else None
+                    )
+                    edgetech_date_deployed = edgetech_buoy.currentState.dateDeployed
+                    # Re-deployment: EdgeTech dateDeployed is meaningfully later than ER's
+                    # (e.g. same units deployed again). Use 1-minute threshold to avoid
+                    # treating microsecond/timestamp precision differences as re-deploy.
+                    is_redeployment = (
+                        er_gear_deployment_date is not None
+                        and edgetech_date_deployed is not None
+                        and (edgetech_date_deployed - er_gear_deployment_date)
+                        > timedelta(minutes=1)
+                        and er_gear.status == "deployed"
+                    )
+                    if is_redeployment:
+                        to_haul.add(serial_number_user_id)
+                        to_deploy.add(serial_number_user_id)
+                        logger.info(
+                            f"Buoy {serial_number_user_id} marked for re-deployment "
+                            f"(EdgeTech dateDeployed={edgetech_date_deployed} > ER gear deployment "
+                            f"{er_gear_deployment_date}); will haul existing gear then deploy new."
+                        )
+                        continue
+
+                    # Check if it needs updating (location or newer data)
                     edgetech_buoy_current_location = (
                         edgetech_buoy.currentState.latDeg,
                         edgetech_buoy.currentState.lonDeg,
@@ -623,11 +658,11 @@ class EdgeTechProcessor:
             2. Fetches existing ER gears and creates mappings for efficient lookups.
             3. Fetches all sources once for manufacturer ID to source ID mapping.
             4. Categorizes buoys based on explicit status checks:
-                - Deploy: Buoys marked as deployed in EdgeTech but not yet in ER.
+                - Deploy: Buoys marked as deployed in EdgeTech but not yet in ER, or re-deployments.
                 - Update: Buoys in ER with location changes or newer data from EdgeTech.
-                - Haul: Buoys explicitly marked as deleted or not deployed in EdgeTech
-                        while still showing as deployed in ER.
-            5. Creates gear payloads directly for each operation.
+                - Haul: Buoys explicitly marked as deleted or not deployed in EdgeTech, or re-deployments
+                  (close existing gear so a new deployment can be created).
+            5. Creates gear payloads: hauls first (close old gear), then deployments, then updates.
 
         Important: Absence of a buoy from the sync window does NOT imply it was hauled.
         Haul events are only generated when EdgeTech explicitly marks a buoy as deleted
@@ -684,6 +719,58 @@ class EdgeTechProcessor:
         )
 
         gear_payloads = []
+
+        # Process hauls first (so re-deployments close old gear before creating new)
+        haul_gears_processed = set()
+
+        for serial_number_user_id in to_haul:
+            serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
+            primary_device_name = f"{serial_number}_{hashed_user_id}_A"
+            single_device_name = f"{serial_number}_{hashed_user_id}"
+
+            # Get the EdgeTech buoy data for potential recovery location
+            edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
+
+            # Find the corresponding ER gear
+            er_gear = er_gears_devices_id_to_gear.get(
+                primary_device_name
+            ) or er_gears_devices_id_to_gear.get(single_device_name)
+
+            if not er_gear:
+                logger.warning(
+                    "No ER gear found for buoy %s (tried %s and %s), skipping haul.",
+                    serial_number_user_id,
+                    primary_device_name,
+                    single_device_name,
+                )
+                continue
+
+            # Skip if we already processed this gear set
+            if er_gear.display_id in haul_gears_processed:
+                logger.info(
+                    f"Gear set {er_gear.display_id} already processed for haul, "
+                    f"skipping buoy {serial_number_user_id}"
+                )
+                continue
+
+            try:
+                payload = self._create_haul_payload(
+                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
+                )
+                gear_payloads.append(payload)
+                haul_gears_processed.add(er_gear.display_id)
+                logger.info(
+                    f"Created haul payload for gear set {er_gear.display_id} "
+                    f"(buoy {serial_number_user_id})"
+                )
+
+            except Exception as e:
+                logger.exception(
+                    "Failed to create haul payload for gear set %s (buoy %s). Error: %s",
+                    er_gear.display_id if er_gear else "unknown",
+                    serial_number_user_id,
+                    str(e),
+                )
 
         # Process deployments (new gear sets)
         for serial_number_user_id in to_deploy:
@@ -837,59 +924,6 @@ class EdgeTechProcessor:
             except Exception as e:
                 logger.exception(
                     "Failed to create gear payload for update %s. Error: %s",
-                    serial_number_user_id,
-                    str(e),
-                )
-
-        # Process hauls (gear sets explicitly marked as deleted or not deployed)
-        # Group devices by gear set to avoid duplicate haul payloads
-        haul_gears_processed = set()
-
-        for serial_number_user_id in to_haul:
-            serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
-            primary_device_name = f"{serial_number}_{hashed_user_id}_A"
-            single_device_name = f"{serial_number}_{hashed_user_id}"
-
-            # Get the EdgeTech buoy data for potential recovery location
-            edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
-
-            # Find the corresponding ER gear
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
-
-            if not er_gear:
-                logger.warning(
-                    "No ER gear found for buoy %s (tried %s and %s), skipping haul.",
-                    serial_number_user_id,
-                    primary_device_name,
-                    single_device_name,
-                )
-                continue
-
-            # Skip if we already processed this gear set
-            if er_gear.display_id in haul_gears_processed:
-                logger.info(
-                    f"Gear set {er_gear.display_id} already processed for haul, "
-                    f"skipping buoy {serial_number_user_id}"
-                )
-                continue
-
-            try:
-                payload = self._create_haul_payload(
-                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
-                )
-                gear_payloads.append(payload)
-                haul_gears_processed.add(er_gear.display_id)
-                logger.info(
-                    f"Created haul payload for gear set {er_gear.display_id} "
-                    f"(buoy {serial_number_user_id})"
-                )
-
-            except Exception as e:
-                logger.exception(
-                    "Failed to create haul payload for gear set %s (buoy %s). Error: %s",
-                    er_gear.display_id if er_gear else "unknown",
                     serial_number_user_id,
                     str(e),
                 )

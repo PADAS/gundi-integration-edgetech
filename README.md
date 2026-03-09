@@ -359,13 +359,21 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
   - Standard: `{serialNumber}_{hashedUserId}`
 - Action: Create deployment gear payload with new UUID as `set_id`
 
-**2. UPDATE (Location Changes)**
+**2. RE-DEPLOY (Same units, new deployment)**
+- Buoy exists in **both** EdgeTech and Earth Ranger, and ER gear is still `status: "deployed"`
+- EdgeTech **`dateDeployed`** is **more than 1 minute after** the ER gear’s deployment time (so we treat it as a new deployment, not an update)
+- Action: **Haul** the existing gear (close it), then **Deploy** a new gear set with a new `set_id`
+- **Processing order**: Haul payload is sent first, then the new deployment payload, so the previous gear is closed before the new one is created
+- **Why**: When the same serial(s) are deployed again (e.g. same two-unit pair with a new `dateDeployed`), we close the previous deployment in ER/Buoy and create a new one instead of updating the old gear in place
+
+**3. UPDATE (Location Changes)**
 - Buoy exists in both systems
 - EdgeTech `lastUpdated` > Earth Ranger `last_updated`, OR location changed
 - Buoy still marked as `isDeployed: true` and `isDeleted: false`
+- **Not** a re-deployment (EdgeTech `dateDeployed` is not more than 1 minute after ER gear’s deployment)
 - Action: Create update gear payload using existing ER gear's `set_id`
 
-**3. HAUL (Retrievals)**
+**4. HAUL (Retrievals)**
 - Buoy exists in both systems, but EdgeTech **explicitly** marks it as:
   - `isDeleted: true`, OR
   - `isDeployed: false`
@@ -373,7 +381,7 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 - **Important**: Absence from EdgeTech data does NOT trigger a haul
 - Action: Create haul gear payload using existing ER gear's `set_id`
 
-**4. NO-OP (Skip)**
+**5. NO-OP (Skip)**
 - Buoy exists in both systems
 - No location change detected
 - Same `lastUpdated` timestamp
@@ -421,6 +429,7 @@ er_gear = er_gears_devices_id_to_gear.get(primary_key) \
 | Scenario | ER Gear Found? | set_id Source |
 |----------|----------------|---------------|
 | **New Deployment** | No | Generate new UUID: `str(uuid4())` |
+| **Re-deployment** | Yes | Haul: use ER gear's `display_id`. Deploy: generate new UUID |
 | **Update Existing** | Yes | Use ER gear's `id` field (UUID) |
 | **Haul Existing** | Yes | Use ER gear's `display_id` field |
 
@@ -957,21 +966,21 @@ Result: Entire system skipped if either unit missing
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 4. IDENTIFY OPERATIONS                                      │
-│    DEPLOY:  In EdgeTech (deployed), not in ER               │
-│    UPDATE:  In both, EdgeTech newer + location changed      │
-│    HAUL:    In both, EdgeTech isDeleted/!isDeployed         │
-│    (Absence from EdgeTech does NOT trigger haul)            │
+│    DEPLOY:   In EdgeTech (deployed), not in ER              │
+│    RE-DEPLOY: In both, EdgeTech dateDeployed > ER + 1 min   │
+│               → Haul existing gear, then deploy new          │
+│    UPDATE:   In both, EdgeTech newer + location changed      │
+│    HAUL:     In both, EdgeTech isDeleted/!isDeployed         │
+│    (Absence from EdgeTech does NOT trigger haul)             │
 └────────────────┬────────────────────────────────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 5. GENERATE GEAR PAYLOADS                                   │
-│    For each operation:                                      │
-│    - Resolve set_id (new UUID or existing ER ID)            │
-│    - Resolve device_id (new UUID or existing source ID)     │
-│    - Extract locations                                      │
-│    - Set device_status (deployed/hauled)                    │
-│    - Build gear payload JSON                                │
+│ 5. GENERATE GEAR PAYLOADS (order matters)                   │
+│    a) Hauls first (close existing gears)                    │
+│    b) Deployments (new gear sets)                           │
+│    c) Updates (location/status changes)                    │
+│    For each: set_id, device_id, locations, device_status    │
 └────────────────┬────────────────────────────────────────────┘
                  │
                  ▼
@@ -1114,6 +1123,7 @@ This integration provides robust synchronization between EdgeTech's Trap Tracker
 ✅ **Efficient database dump** mechanism for bulk data retrieval
 ✅ **Intelligent filtering** to process active and explicitly hauled buoys
 ✅ **Explicit status-based haul detection** (not inferred from absence)
+✅ **Re-deployment handling**: when EdgeTech `dateDeployed` is meaningfully later than ER’s deployment, we close the previous gear and create a new one (hauls sent before new deployments)
 ✅ **Set ID resolution** to correctly update existing vs create new gear sets
 ✅ **Support for complex systems** including two-unit lines
 ✅ **Standardized gear payload format** for the Buoy API

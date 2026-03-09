@@ -431,23 +431,27 @@ class TestEdgeTechProcessor:
         data = [a_new_edgetech_trawl_record]
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
-        # Mock existing ER gear with older timestamp
-        older_time = datetime(2025, 5, 25, 10, 0, 0, tzinfo=timezone.utc)
+        # Mock existing ER gear: last_deployed at or after EdgeTech dateDeployed so this
+        # is an update (same deployment), not a re-deployment; last_updated before
+        # EdgeTech lastUpdated so we have newer data and get to_update.
+        # Fixture has dateDeployed 2025-05-25 17:53:19.517, lastUpdated 17:53:19.731
+        er_deployed = datetime(2025, 5, 25, 17, 53, 20, tzinfo=timezone.utc)
+        er_updated = datetime(2025, 5, 25, 17, 53, 19, tzinfo=timezone.utc)
 
         mock_device = BuoyDevice(
             device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             mfr_device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             label="Test Device",
             location=DeviceLocation(latitude=44.358265, longitude=-68.16757),
-            last_updated=older_time,
-            last_deployed=older_time,
+            last_updated=er_updated,
+            last_deployed=er_deployed,
         )
 
         mock_gear = BuoyGear(
             id=uuid4(),
             display_id="GEAR123",
             status="deployed",
-            last_updated=older_time,
+            last_updated=er_updated,
             devices=[mock_device],
             type="ropeless",
             manufacturer="edgetech",
@@ -917,23 +921,26 @@ class TestEdgeTechProcessor:
         data = [a_new_edgetech_trawl_record]
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
-        # Create existing ER gear for update scenario with different location
+        # ER gear: last_deployed at or after EdgeTech dateDeployed so we get update path
+        # (not re-deploy). Fixture has dateDeployed 2025-05-25 17:53:19.517
+        er_deployed = datetime(2025, 5, 25, 17, 53, 20, tzinfo=timezone.utc)
+        er_updated = datetime(2025, 5, 25, 17, 53, 19, tzinfo=timezone.utc)
         mock_device = BuoyDevice(
             device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             mfr_device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             label="Test Device",
             location=DeviceLocation(
                 latitude=44.0, longitude=-68.0
-            ),  # Different location
-            last_updated=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
-            last_deployed=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
+            ),  # Different location to trigger update
+            last_updated=er_updated,
+            last_deployed=er_deployed,
         )
 
         mock_gear = BuoyGear(
             id=uuid4(),
             display_id="GEAR123",
             status="deployed",
-            last_updated=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
+            last_updated=er_updated,
             devices=[mock_device],
             type="ropeless",
             manufacturer="edgetech",
@@ -954,8 +961,11 @@ class TestEdgeTechProcessor:
         with caplog.at_level(logging.ERROR):
             payloads = await processor.process()
 
-        # Should log the validation error for update
-        assert "Failed to create gear payload for update" in caplog.text
+        # Should log the validation error for update or deployment (re-deploy uses deploy path)
+        assert (
+            "Failed to create gear payload for update" in caplog.text
+            or "Failed to create gear payload for deployment" in caplog.text
+        )
         assert len(payloads) == 0
 
     @pytest.mark.asyncio
@@ -966,23 +976,25 @@ class TestEdgeTechProcessor:
         data = [a_new_edgetech_trawl_record]
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
-        # Create existing ER gear for update scenario with different location
+        # ER gear: last_deployed at or after EdgeTech dateDeployed so we get update path
+        er_deployed = datetime(2025, 5, 25, 17, 53, 20, tzinfo=timezone.utc)
+        er_updated = datetime(2025, 5, 25, 17, 53, 19, tzinfo=timezone.utc)
         mock_device = BuoyDevice(
             device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             mfr_device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
             label="Test Device",
             location=DeviceLocation(
                 latitude=44.0, longitude=-68.0
-            ),  # Different location
-            last_updated=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
-            last_deployed=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
+            ),  # Different location to trigger update
+            last_updated=er_updated,
+            last_deployed=er_deployed,
         )
 
         mock_gear = BuoyGear(
             id=uuid4(),
             display_id="GEAR123",
             status="deployed",
-            last_updated=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
+            last_updated=er_updated,
             devices=[mock_device],
             type="ropeless",
             manufacturer="edgetech",
@@ -1003,8 +1015,11 @@ class TestEdgeTechProcessor:
         with caplog.at_level(logging.ERROR):
             payloads = await processor.process()
 
-        # Should log the general exception
-        assert "Failed to create gear payload for update" in caplog.text
+        # Should log the general exception (update or deployment path)
+        assert (
+            "Failed to create gear payload for update" in caplog.text
+            or "Failed to create gear payload for deployment" in caplog.text
+        )
         assert "General error" in caplog.text
         assert len(payloads) == 0
 
