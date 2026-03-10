@@ -142,7 +142,10 @@ class EdgeTechProcessor:
             secondary_last_deployed = (
                 end_unit_device_from_er.last_deployed or last_updated
             )
-            secondary_recorded_at = end_unit_device_from_er.last_updated or last_updated
+            # Use same recorded_at as start unit so we don't resend an existing
+            # (device_id, recorded_at) pair and so both devices are consistent.
+            # ER-sourced last_updated is kept in device_additional_data for traceability.
+            secondary_recorded_at = deployment_recorded_at
             secondary_device_additional_data = {
                 "serialNumber": secondary_device_id.split("_")[0],
                 "lastUpdated": (
