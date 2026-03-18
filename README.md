@@ -365,6 +365,13 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 - Action: **Haul** the existing gear (close it), then **Deploy** a new gear set with a new `set_id`
 - **Processing order**: Haul payload is sent first, then the new deployment payload, so the previous gear is closed before the new one is created
 - **Why**: When the same serial(s) are deployed again (e.g. same two-unit pair with a new `dateDeployed`), we close the previous deployment in ER/Buoy and create a new one instead of updating the old gear in place
+- **Haul timestamp for re-deployments**: When a buoy is hauled and redeployed within seconds, the `currentState.dateRecovered` is cleared by the redeploy. In this case, the haul payload’s `recorded_at` is sourced from the most recent `dateRecovered` in `changeRecords` to avoid colliding with the deploy’s `recorded_at` (which uses `dateDeployed`). Recovery location (`recoveredLatDeg`/`recoveredLonDeg`) is also recovered from `changeRecords` in the same way.
+
+**2a. DEPLOY (Recovery from missed deployment)**
+- Buoy exists in **both** EdgeTech and Earth Ranger, but ER gear `status` is **not** `"deployed"` (e.g. `"hauled"`)
+- EdgeTech shows `isDeployed: true`
+- **Why**: This handles the case where a previous re-deployment haul succeeded but the deploy failed (e.g. `recorded_at` collision). On subsequent processor runs, the hauled ER gear + deployed EdgeTech state is recognized as a missed deployment.
+- Action: Create deployment gear payload with new UUID as `set_id` (no haul needed since gear is already hauled)
 
 **3. UPDATE (Location Changes)**
 - Buoy exists in both systems
@@ -869,8 +876,9 @@ When EdgeTech explicitly marks a buoy as `isDeleted: true` or `isDeployed: false
 ```
 
 **Location Priority for Hauls**:
-1. Recovery location from EdgeTech (`recoveredLatDeg`/`recoveredLonDeg`) if available
-2. Fallback to last deployed location from Earth Ranger
+1. Recovery location from EdgeTech `currentState` (`recoveredLatDeg`/`recoveredLonDeg`) if available
+2. Recovery location from EdgeTech `changeRecords` (for re-deployments where `currentState` was overwritten)
+3. Fallback to last deployed location from Earth Ranger
 
 **Note**: All devices in the gear set use the same recovery location since there's only one recovery point.
 
@@ -969,6 +977,8 @@ Result: Entire system skipped if either unit missing
 │    DEPLOY:   In EdgeTech (deployed), not in ER              │
 │    RE-DEPLOY: In both, EdgeTech dateDeployed > ER + 1 min   │
 │               → Haul existing gear, then deploy new          │
+│    RECOVERY: ER gear hauled but EdgeTech isDeployed=true     │
+│               → Deploy new gear (haul already done)          │
 │    UPDATE:   In both, EdgeTech newer + location changed      │
 │    HAUL:     In both, EdgeTech isDeleted/!isDeployed         │
 │    (Absence from EdgeTech does NOT trigger haul)             │
@@ -1123,7 +1133,8 @@ This integration provides robust synchronization between EdgeTech's Trap Tracker
 ✅ **Efficient database dump** mechanism for bulk data retrieval
 ✅ **Intelligent filtering** to process active and explicitly hauled buoys
 ✅ **Explicit status-based haul detection** (not inferred from absence)
-✅ **Re-deployment handling**: when EdgeTech `dateDeployed` is meaningfully later than ER’s deployment, we close the previous gear and create a new one (hauls sent before new deployments)
+✅ **Re-deployment handling**: when EdgeTech `dateDeployed` is meaningfully later than ER’s deployment, we close the previous gear and create a new one (hauls sent before new deployments). Haul timestamps and recovery locations are sourced from `changeRecords` when a rapid haul+redeploy clears `currentState`.
+✅ **Recovery from missed deployments**: if a re-deployment haul succeeded but the deploy failed, subsequent runs detect the hauled ER gear vs deployed EdgeTech state and create the missing deployment
 ✅ **Set ID resolution** to correctly update existing vs create new gear sets
 ✅ **Support for complex systems** including two-unit lines
 ✅ **Standardized gear payload format** for the Buoy API

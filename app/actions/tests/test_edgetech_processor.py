@@ -1383,6 +1383,7 @@ class TestEdgeTechProcessor:
         mock_gear = Mock()
         mock_gear.devices = [mock_device]
         mock_gear.manufacturer = "edgetech"  # This is important for the filtering
+        mock_gear.status = "deployed"
         mock_gear.last_updated = datetime(
             2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc
         )  # Older than the buoy's lastUpdated
@@ -1742,3 +1743,241 @@ class TestEdgeTechProcessor:
         assert len(payloads) == 1
         assert payloads[0]["deployment_type"] == "trawl"
         assert len(payloads[0]["devices"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_hauled_in_er_deployed_in_edgetech(
+        self, mocker, a_new_edgetech_trawl_record
+    ):
+        """When ER gear is hauled but EdgeTech shows deployed, treat as new deployment."""
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="token", er_url="url"
+        )
+
+        user_id = a_new_edgetech_trawl_record["userId"]
+        serial_number = a_new_edgetech_trawl_record["serialNumber"]
+        hashed_user_id = get_hashed_user_id(user_id)
+        device_id = f"{serial_number}_{hashed_user_id}_A"
+
+        mock_device = BuoyDevice(
+            device_id="some-uuid",
+            mfr_device_id=device_id,
+            label="Device A",
+            location=DeviceLocation(latitude=44.0, longitude=-68.0),
+            last_updated=datetime.now(timezone.utc),
+            last_deployed=datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc),
+        )
+
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR123",
+            status="hauled",  # Already hauled in ER
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[mock_device],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {device_id: mock_gear}
+        buoy_key = f"{serial_number}/{hashed_user_id}"
+        serial_number_to_edgetech_buoy = {buoy_key: processor._data[0]}
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert buoy_key in to_deploy
+        assert len(to_haul) == 0
+        assert len(to_update) == 0
+
+    @pytest.mark.asyncio
+    async def test_redeployment_haul_uses_change_record_date_recovered(self):
+        """For re-deployments, haul payload should use dateRecovered from changeRecords
+        when currentState dateRecovered is null (cleared by the redeploy)."""
+        user_id = "66fff43f7386585d6687e3d3"
+        serial_number = "88CE99D39E"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        # Simulate the re-deployment scenario: buoy hauled then redeployed within seconds
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": "1773845753701",
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8C769E",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 43.8309358,
+                "lonDeg": -69.6456942,
+                "endLatDeg": 43.8315133,
+                "endLonDeg": -69.6456975,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-03-18T14:55:53.191Z",
+                "dateRecovered": None,  # Cleared by redeploy
+                "recoveredLatDeg": None,  # Cleared by redeploy
+                "recoveredLonDeg": None,
+                "lastUpdated": "2026-03-18T14:55:53.701Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-18T14:55:53.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": None,
+                            "newValue": "2026-03-18T14:55:53.191Z",
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": "2026-03-18T14:48:26.078Z",
+                            "newValue": None,
+                        },
+                        {"key": "isDeployed", "oldValue": False, "newValue": True},
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": 43.8495062,
+                            "newValue": None,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": -69.6290056,
+                            "newValue": None,
+                        },
+                    ],
+                },
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-18T14:55:07.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-03-10T11:16:57.467Z",
+                            "newValue": None,
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-03-18T14:48:26.078Z",
+                        },
+                        {"key": "isDeployed", "oldValue": True, "newValue": False},
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": None,
+                            "newValue": 43.8495062,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": None,
+                            "newValue": -69.6290056,
+                        },
+                        {
+                            "key": "recoveredRangeM",
+                            "oldValue": None,
+                            "newValue": 50.932,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        # Create the ER gear that was deployed earlier (March 10)
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=43.8308732, longitude=-69.6453918),
+            last_updated=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-OLD",
+            status="deployed",
+            last_updated=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        # Test _create_haul_payload uses dateRecovered from changeRecords
+        payload = processor._create_haul_payload(er_gear=mock_gear, edgetech_buoy=buoy)
+
+        # The haul recorded_at should be from the changeRecords dateRecovered (14:48:26)
+        # NOT from lastUpdated (14:55:53) which would collide with the deploy
+        assert payload["devices"][0]["recorded_at"] == "2026-03-18T14:48:26+00:00"
+
+        # Recovery location should also come from changeRecords
+        assert payload["devices"][0]["location"]["latitude"] == 43.8495062
+        assert payload["devices"][0]["location"]["longitude"] == -69.6290056
+
+    @pytest.mark.asyncio
+    async def test_redeployment_identify_haul_and_deploy(self):
+        """Re-deployment: same serial hauled and redeployed within seconds should
+        produce both a haul and a deploy."""
+        user_id = "66fff43f7386585d6687e3d3"
+        serial_number = "88CE99D39E"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": "1773845753701",
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8C769E",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 43.8309358,
+                "lonDeg": -69.6456942,
+                "endLatDeg": 43.8315133,
+                "endLonDeg": -69.6456975,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-03-18T14:55:53.191Z",
+                "dateRecovered": None,
+                "lastUpdated": "2026-03-18T14:55:53.701Z",
+            },
+            "changeRecords": [],
+        }
+
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=43.8308732, longitude=-69.6453918),
+            last_updated=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-OLD",
+            status="deployed",
+            last_updated=datetime(2026, 3, 10, 11, 16, 57, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {device_id_a: mock_gear}
+        buoy_key = f"{serial_number}/{hashed_user_id}"
+        serial_number_to_edgetech_buoy = {buoy_key: processor._data[0]}
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        # Should be in both haul and deploy (re-deployment)
+        assert buoy_key in to_haul
+        assert buoy_key in to_deploy
+        assert len(to_update) == 0

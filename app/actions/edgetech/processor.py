@@ -244,26 +244,53 @@ class EdgeTechProcessor:
         recovery_lon = None
 
         # Determine the recorded_at timestamp for the haul event
-        # Use dateRecovered if available, otherwise use lastUpdated, or current time
+        # Use dateRecovered if available; for re-deployments (haul then immediate
+        # redeploy) the currentState dateRecovered is cleared, so check changeRecords
+        # for the most recent dateRecovered value. Fall back to lastUpdated.
         haul_recorded_at = datetime.now(timezone.utc)
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
                 haul_recorded_at = edgetech_buoy.currentState.dateRecovered
-            elif edgetech_buoy.currentState.lastUpdated:
-                haul_recorded_at = edgetech_buoy.currentState.lastUpdated
+            else:
+                # Look for dateRecovered in changeRecords (re-deployment: currentState
+                # was overwritten by the redeploy, but the haul timestamp is preserved
+                # in the change history)
+                recovered_at_from_changes = (
+                    self._get_date_recovered_from_change_records(edgetech_buoy)
+                )
+                if recovered_at_from_changes:
+                    haul_recorded_at = recovered_at_from_changes
+                    logger.info(
+                        f"Using dateRecovered from changeRecords for haul of "
+                        f"{edgetech_buoy.serialNumber}: {recovered_at_from_changes}"
+                    )
+                elif edgetech_buoy.currentState.lastUpdated:
+                    haul_recorded_at = edgetech_buoy.currentState.lastUpdated
 
-        if (
-            edgetech_buoy
-            and edgetech_buoy.currentState.recoveredLatDeg
-            and edgetech_buoy.currentState.recoveredLonDeg
-        ):
-            recovery_location_available = True
-            recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
-            recovery_lon = edgetech_buoy.currentState.recoveredLonDeg
-            logger.info(
-                f"Using recovery location from EdgeTech for gear {er_gear.display_id}: "
-                f"({recovery_lat}, {recovery_lon})"
-            )
+        if edgetech_buoy:
+            if (
+                edgetech_buoy.currentState.recoveredLatDeg
+                and edgetech_buoy.currentState.recoveredLonDeg
+            ):
+                recovery_location_available = True
+                recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
+                recovery_lon = edgetech_buoy.currentState.recoveredLonDeg
+            else:
+                # Re-deployment: recovery location may be in changeRecords
+                # (currentState was overwritten by the redeploy)
+                rec_lat, rec_lon = self._get_recovery_location_from_change_records(
+                    edgetech_buoy
+                )
+                if rec_lat is not None and rec_lon is not None:
+                    recovery_location_available = True
+                    recovery_lat = rec_lat
+                    recovery_lon = rec_lon
+
+            if recovery_location_available:
+                logger.info(
+                    f"Using recovery location for gear {er_gear.display_id}: "
+                    f"({recovery_lat}, {recovery_lon})"
+                )
 
         for device in er_gear.devices:
             # Use recovery location if available, otherwise use deployed location from ER
@@ -327,6 +354,68 @@ class EdgeTechProcessor:
             or not record.currentState.isDeployed
             or record.currentState.dateRecovered is not None
         )
+
+    @staticmethod
+    def _get_date_recovered_from_change_records(buoy: Buoy) -> Optional[datetime]:
+        """
+        Find the most recent dateRecovered value from a buoy's changeRecords.
+
+        This is needed for re-deployment scenarios where the buoy was hauled and
+        immediately redeployed — the currentState no longer has dateRecovered
+        (cleared by the redeploy), but the changeRecords preserve the haul timestamp.
+
+        Returns:
+            The most recent dateRecovered datetime, or None if not found.
+        """
+        most_recent = None
+        for record in buoy.changeRecords:
+            for change in record.changes:
+                if change.key == "dateRecovered" and change.newValue is not None:
+                    try:
+                        recovered_dt = datetime.fromisoformat(
+                            str(change.newValue).replace("Z", "+00:00")
+                        )
+                        if most_recent is None or recovered_dt > most_recent:
+                            most_recent = recovered_dt
+                    except (ValueError, TypeError):
+                        continue
+        return most_recent
+
+    @staticmethod
+    def _get_recovery_location_from_change_records(
+        buoy: Buoy,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Find the most recent recovery location from a buoy's changeRecords.
+
+        Needed for re-deployment scenarios where recoveredLatDeg/recoveredLonDeg
+        in currentState were cleared by the redeploy.
+
+        Returns:
+            Tuple of (latitude, longitude) or (None, None) if not found.
+        """
+        # Find the changeRecord that set dateRecovered most recently —
+        # its sibling entries will have the recovery coordinates.
+        best_timestamp = None
+        best_lat = None
+        best_lon = None
+        for record in buoy.changeRecords:
+            lat = None
+            lon = None
+            has_recovery = False
+            for change in record.changes:
+                if change.key == "dateRecovered" and change.newValue is not None:
+                    has_recovery = True
+                elif change.key == "recoveredLatDeg" and change.newValue is not None:
+                    lat = change.newValue
+                elif change.key == "recoveredLonDeg" and change.newValue is not None:
+                    lon = change.newValue
+            if has_recovery and lat is not None and lon is not None:
+                if best_timestamp is None or record.timestamp > best_timestamp:
+                    best_timestamp = record.timestamp
+                    best_lat = lat
+                    best_lon = lon
+        return best_lat, best_lon
 
     def _should_skip_buoy(self, record: Buoy) -> Tuple[bool, Optional[str]]:
         """
@@ -503,6 +592,19 @@ class EdgeTechProcessor:
                         logger.info(
                             f"Buoy {serial_number_user_id} already hauled in ER, skipping"
                         )
+                elif (
+                    er_gear.status != "deployed"
+                    and edgetech_buoy.currentState.isDeployed
+                ):
+                    # ER gear was hauled (e.g. previous re-deployment haul succeeded
+                    # but the deploy failed), and EdgeTech shows it as deployed now.
+                    # Treat as a new deployment so the gear gets created in ER.
+                    to_deploy.add(serial_number_user_id)
+                    logger.info(
+                        f"Buoy {serial_number_user_id} marked for deployment "
+                        f"(ER gear status={er_gear.status} but EdgeTech isDeployed=True; "
+                        f"recovering missed deployment)"
+                    )
                 else:
                     # Buoy is still deployed - check for re-deployment first (new deployment
                     # with same serials: close previous gear and create new one)
