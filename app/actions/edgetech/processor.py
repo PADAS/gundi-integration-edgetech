@@ -134,14 +134,21 @@ class EdgeTechProcessor:
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
         elif end_unit_device_from_er:
-            # End unit not in EdgeTech sync window (e.g. location-only update on start unit);
-            # use current state from ER so we can still send the start unit's location update.
+            # End unit not in EdgeTech sync window (e.g. location-only update on start unit,
+            # or re-deployment where end unit wasn't updated in EdgeTech);
+            # use current state from ER so we can still send the payload.
             secondary_device_id = end_unit_device_from_er.mfr_device_id
             secondary_latitude = end_unit_device_from_er.location.latitude
             secondary_longitude = end_unit_device_from_er.location.longitude
-            secondary_last_deployed = (
-                end_unit_device_from_er.last_deployed or last_updated
-            )
+            # For initial deployments (including re-deployments), use the start
+            # unit's deployment time so both devices reflect the new deployment.
+            # For updates, use the ER value (we're not re-deploying).
+            if include_initial_deployment:
+                secondary_last_deployed = last_deployed
+            else:
+                secondary_last_deployed = (
+                    end_unit_device_from_er.last_deployed or last_updated
+                )
             # Use same recorded_at as start unit so we don't resend an existing
             # (device_id, recorded_at) pair and so both devices are consistent.
             # ER-sourced last_updated is kept in device_additional_data for traceability.
@@ -895,37 +902,34 @@ class EdgeTechProcessor:
                     )
 
                     if not end_unit_buoy:
-                        # For re-deployments, try to get end unit from the (just-hauled)
-                        # ER gear so we don't skip the deploy after already hauling.
-                        end_unit_device_from_er = None
-                        if serial_number_user_id in to_haul:
-                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
-                            er_gear = er_gears_devices_id_to_gear.get(
-                                f"{serial_number_user_id.replace('/', '_')}_A"
-                            ) or er_gears_devices_id_to_gear.get(
-                                serial_number_user_id.replace("/", "_")
+                        # End unit not in sync window. Try to get it from ER
+                        # (covers re-deployments where haul already happened,
+                        # and recovery deployments where ER gear was hauled).
+                        end_unit_mfr_id = (
+                            f"{edgetech_buoy.currentState.endUnit}"
+                            f"_{get_hashed_user_id(edgetech_buoy.userId)}"
+                        )
+                        er_gear = er_gears_devices_id_to_gear.get(
+                            f"{serial_number_user_id.replace('/', '_')}_A"
+                        ) or er_gears_devices_id_to_gear.get(
+                            serial_number_user_id.replace("/", "_")
+                        )
+                        if er_gear:
+                            for er_device in er_gear.devices:
+                                if er_device.mfr_device_id == end_unit_mfr_id:
+                                    end_unit_device_from_er = er_device
+                                    break
+                        if end_unit_device_from_er:
+                            logger.info(
+                                "End unit %s not in sync window; "
+                                "using ER state for deployment of %s",
+                                edgetech_buoy.currentState.endUnit,
+                                serial_number_user_id,
                             )
-                            if er_gear:
-                                for er_device in er_gear.devices:
-                                    if er_device.mfr_device_id == end_unit_mfr_id:
-                                        end_unit_device_from_er = er_device
-                                        break
-                            if end_unit_device_from_er:
-                                logger.info(
-                                    "End unit %s not in sync window; using ER state for re-deployment of %s",
-                                    edgetech_buoy.currentState.endUnit,
-                                    serial_number_user_id,
-                                )
-                            else:
-                                logger.warning(
-                                    "End unit buoy %s not found for re-deployment %s, skipping deployment.",
-                                    edgetech_buoy.currentState.endUnit,
-                                    serial_number_user_id,
-                                )
-                                continue
                         else:
                             logger.warning(
-                                "End unit buoy %s not found for serial number %s, skipping deployment.",
+                                "End unit buoy %s not found for %s, "
+                                "skipping deployment.",
                                 edgetech_buoy.currentState.endUnit,
                                 serial_number_user_id,
                             )

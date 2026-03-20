@@ -375,10 +375,11 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 
 **3. UPDATE (Location Changes)**
 - Buoy exists in both systems
-- EdgeTech `lastUpdated` > Earth Ranger `last_updated`, OR location changed
+- Location has changed (primary device coordinates differ from ER)
 - Buoy still marked as `isDeployed: true` and `isDeleted: false`
 - **Not** a re-deployment (EdgeTech `dateDeployed` is not more than 1 minute after ER gear’s deployment)
-- Action: Create update gear payload using existing ER gear's `set_id`
+- **Note**: Buoys are initially identified for update when `lastUpdated > last_updated` OR location changed, but during payload generation, updates are only sent when the location has actually changed. Metadata-only updates (newer timestamp, same location) are skipped.
+- Action: Create update gear payload using existing ER gear’s `set_id`
 
 **4. HAUL (Retrievals)**
 - Buoy exists in both systems, but EdgeTech **explicitly** marks it as:
