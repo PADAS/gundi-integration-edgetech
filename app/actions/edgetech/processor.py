@@ -78,7 +78,8 @@ class EdgeTechProcessor:
             manufacturer_id_to_source_id: Mapping of manufacturer_id to source_id for existing sources
             end_unit_buoy: Optional second buoy for two-unit lines (from EdgeTech sync window)
             end_unit_device_from_er: Optional end-unit device from ER when end_unit_buoy is not
-                in the sync window (e.g. location-only update on start unit); used for updates only.
+                in the sync window; used for updates and deployments (e.g. re-deployments or
+                recovery deployments where the end unit wasn't in the EdgeTech sync window).
             set_id: Optional gear set ID (auto-generated if not provided)
             include_initial_deployment: Whether to include initial_deployment_date
 
@@ -722,7 +723,7 @@ class EdgeTechProcessor:
         skip_keys: Set[str] = set()
         seen_pairs: Set[Tuple[str, str]] = set()  # (min_serial, max_serial) for dedup
 
-        for key, buoy in serial_number_to_edgetech_buoy.items():
+        for buoy in serial_number_to_edgetech_buoy.values():
             if not buoy.currentState.isTwoUnitLine or not buoy.currentState.endUnit:
                 continue
             if buoy.currentState.startUnit:
