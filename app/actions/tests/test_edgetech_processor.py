@@ -1415,7 +1415,7 @@ class TestEdgeTechProcessor:
 
         This is the bug fix test: Previously, position updates were incorrectly skipped because
         the code used dateDeployed for recorded_at, and dateDeployed doesn't change on position updates.
-        Now we use lastUpdated for updates, so position changes get a new recorded_at timestamp.
+        Now we use datetime.now(utc) for updates, so position changes always get a unique recorded_at.
         """
         # Create EdgeTech buoy with:
         # - dateDeployed: 22:40:08 (same as ER)
@@ -1498,12 +1498,15 @@ class TestEdgeTechProcessor:
         assert "skipped - recorded_at" not in caplog.text
 
     @pytest.mark.asyncio
-    async def test_create_gear_payload_uses_last_updated_for_updates(self):
+    async def test_create_gear_payload_uses_current_time_for_update_recorded_at(self):
         """
-        Test that _create_gear_payload uses lastUpdated (not dateDeployed) for recorded_at
-        when include_initial_deployment=False (i.e., for updates).
+        Test that _create_gear_payload uses datetime.now(utc) for recorded_at
+        when include_initial_deployment=False (i.e., for position updates).
 
-        This ensures position updates get a unique recorded_at timestamp.
+        EdgeTech can update latDeg/lonDeg without changing lastUpdated, so
+        reusing lastUpdated as recorded_at would collide with a previously-
+        accepted observation and be rejected by ER's (device_id, recorded_at)
+        unique constraint.  Using current time guarantees uniqueness.
         """
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
 
@@ -1551,12 +1554,20 @@ class TestEdgeTechProcessor:
             include_initial_deployment=False,
         )
 
-        # For updates, recorded_at should be lastUpdated (the fix!)
-        assert (
-            payload_update["devices"][0]["recorded_at"] == "2026-01-15T22:42:49+00:00"
+        # For updates, recorded_at should be current time (not lastUpdated)
+        update_recorded_at = datetime.fromisoformat(
+            payload_update["devices"][0]["recorded_at"]
         )
+        # Should be close to now (within 5 seconds) and NOT equal to lastUpdated or dateDeployed
+        assert update_recorded_at != datetime(
+            2026, 1, 15, 22, 42, 49, tzinfo=timezone.utc
+        )
+        assert update_recorded_at != datetime(
+            2026, 1, 15, 22, 40, 8, tzinfo=timezone.utc
+        )
+        assert (datetime.now(timezone.utc) - update_recorded_at).total_seconds() < 5
 
-        # Verify the timestamps are different
+        # Verify the timestamps are different from initial deployment
         assert (
             payload_initial["devices"][0]["recorded_at"]
             != payload_update["devices"][0]["recorded_at"]
@@ -1569,7 +1580,7 @@ class TestEdgeTechProcessor:
 
         Scenario: A deployed gear has its position updated in EdgeTech, but dateDeployed
         remains unchanged. The update should be processed and create a payload with
-        the new position and lastUpdated as recorded_at.
+        the new position and a unique recorded_at (current time).
         """
         # EdgeTech data with position change
         edgetech_data = {
@@ -1638,8 +1649,16 @@ class TestEdgeTechProcessor:
         assert device["location"]["latitude"] == 41.0
         assert device["location"]["longitude"] == -71.0
 
-        # Key assertion: recorded_at should be lastUpdated, not dateDeployed
-        assert device["recorded_at"] == "2026-01-15T12:00:00+00:00"
+        # Key assertion: recorded_at should be current time (not lastUpdated or dateDeployed)
+        # to avoid duplicate rejection when EdgeTech updates location without changing lastUpdated
+        update_recorded_at = datetime.fromisoformat(device["recorded_at"])
+        assert update_recorded_at != datetime(
+            2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc
+        )
+        assert update_recorded_at != datetime(
+            2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc
+        )
+        assert (datetime.now(timezone.utc) - update_recorded_at).total_seconds() < 5
 
         # Verify logs show update (not skipped)
         assert "marked for update" in caplog.text
