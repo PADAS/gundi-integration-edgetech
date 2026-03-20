@@ -269,8 +269,8 @@ class EdgeTechProcessor:
 
         if edgetech_buoy:
             if (
-                edgetech_buoy.currentState.recoveredLatDeg
-                and edgetech_buoy.currentState.recoveredLonDeg
+                edgetech_buoy.currentState.recoveredLatDeg is not None
+                and edgetech_buoy.currentState.recoveredLonDeg is not None
             ):
                 recovery_location_available = True
                 recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
@@ -884,6 +884,7 @@ class EdgeTechProcessor:
             try:
                 # Get end unit buoy if this is a two-unit line
                 end_unit_buoy = None
+                end_unit_device_from_er = None
                 if (
                     edgetech_buoy.currentState.isTwoUnitLine
                     and edgetech_buoy.currentState.endUnit
@@ -894,12 +895,41 @@ class EdgeTechProcessor:
                     )
 
                     if not end_unit_buoy:
-                        logger.warning(
-                            "End unit buoy %s not found for serial number %s, skipping deployment.",
-                            edgetech_buoy.currentState.endUnit,
-                            serial_number_user_id,
-                        )
-                        continue
+                        # For re-deployments, try to get end unit from the (just-hauled)
+                        # ER gear so we don't skip the deploy after already hauling.
+                        end_unit_device_from_er = None
+                        if serial_number_user_id in to_haul:
+                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
+                            er_gear = er_gears_devices_id_to_gear.get(
+                                f"{serial_number_user_id.replace('/', '_')}_A"
+                            ) or er_gears_devices_id_to_gear.get(
+                                serial_number_user_id.replace("/", "_")
+                            )
+                            if er_gear:
+                                for er_device in er_gear.devices:
+                                    if er_device.mfr_device_id == end_unit_mfr_id:
+                                        end_unit_device_from_er = er_device
+                                        break
+                            if end_unit_device_from_er:
+                                logger.info(
+                                    "End unit %s not in sync window; using ER state for re-deployment of %s",
+                                    edgetech_buoy.currentState.endUnit,
+                                    serial_number_user_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "End unit buoy %s not found for re-deployment %s, skipping deployment.",
+                                    edgetech_buoy.currentState.endUnit,
+                                    serial_number_user_id,
+                                )
+                                continue
+                        else:
+                            logger.warning(
+                                "End unit buoy %s not found for serial number %s, skipping deployment.",
+                                edgetech_buoy.currentState.endUnit,
+                                serial_number_user_id,
+                            )
+                            continue
 
                 if edgetech_buoy.currentState.startUnit:
                     # This record is for the end unit, skip it (will be handled by start unit)
@@ -917,6 +947,9 @@ class EdgeTechProcessor:
                     device_status="deployed",
                     manufacturer_id_to_source_id=manufacturer_id_to_source_id,
                     end_unit_buoy=end_unit_buoy,
+                    end_unit_device_from_er=(
+                        end_unit_device_from_er if not end_unit_buoy else None
+                    ),
                     include_initial_deployment=True,
                 )
                 gear_payloads.append(payload)
