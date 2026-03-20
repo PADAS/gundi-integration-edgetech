@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from app.actions.buoy import BuoyClient
-from app.actions.buoy.types import BuoyGear
+from app.actions.buoy.types import BuoyDevice, BuoyGear
 from app.actions.edgetech.types import Buoy
 from app.actions.utils import get_hashed_user_id
 
@@ -65,6 +65,7 @@ class EdgeTechProcessor:
         device_status: str,
         manufacturer_id_to_source_id: Dict[str, str],
         end_unit_buoy: Optional[Buoy] = None,
+        end_unit_device_from_er: Optional[BuoyDevice] = None,
         set_id: Optional[str] = None,
         include_initial_deployment: bool = True,
     ) -> Dict[str, Any]:
@@ -75,7 +76,10 @@ class EdgeTechProcessor:
             buoy: The main Buoy object
             device_status: Status of the device (deployed/hauled)
             manufacturer_id_to_source_id: Mapping of manufacturer_id to source_id for existing sources
-            end_unit_buoy: Optional second buoy for two-unit lines
+            end_unit_buoy: Optional second buoy for two-unit lines (from EdgeTech sync window)
+            end_unit_device_from_er: Optional end-unit device from ER when end_unit_buoy is not
+                in the sync window; used for updates and deployments (e.g. re-deployments or
+                recovery deployments where the end unit wasn't in the EdgeTech sync window).
             set_id: Optional gear set ID (auto-generated if not provided)
             include_initial_deployment: Whether to include initial_deployment_date
 
@@ -130,6 +134,34 @@ class EdgeTechProcessor:
                 )
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
+        elif end_unit_device_from_er:
+            # End unit not in EdgeTech sync window (e.g. location-only update on start unit,
+            # or re-deployment where end unit wasn't updated in EdgeTech);
+            # use current state from ER so we can still send the payload.
+            secondary_device_id = end_unit_device_from_er.mfr_device_id
+            secondary_latitude = end_unit_device_from_er.location.latitude
+            secondary_longitude = end_unit_device_from_er.location.longitude
+            # For initial deployments (including re-deployments), use the start
+            # unit's deployment time so both devices reflect the new deployment.
+            # For updates, use the ER value (we're not re-deploying).
+            if include_initial_deployment:
+                secondary_last_deployed = last_deployed
+            else:
+                secondary_last_deployed = (
+                    end_unit_device_from_er.last_deployed or last_updated
+                )
+            # Use same recorded_at as start unit so we don't resend an existing
+            # (device_id, recorded_at) pair and so both devices are consistent.
+            # ER-sourced last_updated is kept in device_additional_data for traceability.
+            secondary_recorded_at = deployment_recorded_at
+            secondary_device_additional_data = {
+                "serialNumber": secondary_device_id.split("_")[0],
+                "lastUpdated": (
+                    end_unit_device_from_er.last_updated.isoformat()
+                    if end_unit_device_from_er.last_updated
+                    else None
+                ),
+            }
 
         main_device = {
             "device_id": manufacturer_id_to_source_id.get(main_device_id)
@@ -220,26 +252,53 @@ class EdgeTechProcessor:
         recovery_lon = None
 
         # Determine the recorded_at timestamp for the haul event
-        # Use dateRecovered if available, otherwise use lastUpdated, or current time
+        # Use dateRecovered if available; for re-deployments (haul then immediate
+        # redeploy) the currentState dateRecovered is cleared, so check changeRecords
+        # for the most recent dateRecovered value. Fall back to lastUpdated.
         haul_recorded_at = datetime.now(timezone.utc)
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
                 haul_recorded_at = edgetech_buoy.currentState.dateRecovered
-            elif edgetech_buoy.currentState.lastUpdated:
-                haul_recorded_at = edgetech_buoy.currentState.lastUpdated
+            else:
+                # Look for dateRecovered in changeRecords (re-deployment: currentState
+                # was overwritten by the redeploy, but the haul timestamp is preserved
+                # in the change history)
+                recovered_at_from_changes = (
+                    self._get_date_recovered_from_change_records(edgetech_buoy)
+                )
+                if recovered_at_from_changes:
+                    haul_recorded_at = recovered_at_from_changes
+                    logger.info(
+                        f"Using dateRecovered from changeRecords for haul of "
+                        f"{edgetech_buoy.serialNumber}: {recovered_at_from_changes}"
+                    )
+                elif edgetech_buoy.currentState.lastUpdated:
+                    haul_recorded_at = edgetech_buoy.currentState.lastUpdated
 
-        if (
-            edgetech_buoy
-            and edgetech_buoy.currentState.recoveredLatDeg
-            and edgetech_buoy.currentState.recoveredLonDeg
-        ):
-            recovery_location_available = True
-            recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
-            recovery_lon = edgetech_buoy.currentState.recoveredLonDeg
-            logger.info(
-                f"Using recovery location from EdgeTech for gear {er_gear.display_id}: "
-                f"({recovery_lat}, {recovery_lon})"
-            )
+        if edgetech_buoy:
+            if (
+                edgetech_buoy.currentState.recoveredLatDeg is not None
+                and edgetech_buoy.currentState.recoveredLonDeg is not None
+            ):
+                recovery_location_available = True
+                recovery_lat = edgetech_buoy.currentState.recoveredLatDeg
+                recovery_lon = edgetech_buoy.currentState.recoveredLonDeg
+            else:
+                # Re-deployment: recovery location may be in changeRecords
+                # (currentState was overwritten by the redeploy)
+                rec_lat, rec_lon = self._get_recovery_location_from_change_records(
+                    edgetech_buoy
+                )
+                if rec_lat is not None and rec_lon is not None:
+                    recovery_location_available = True
+                    recovery_lat = rec_lat
+                    recovery_lon = rec_lon
+
+            if recovery_location_available:
+                logger.info(
+                    f"Using recovery location for gear {er_gear.display_id}: "
+                    f"({recovery_lat}, {recovery_lon})"
+                )
 
         for device in er_gear.devices:
             # Use recovery location if available, otherwise use deployed location from ER
@@ -303,6 +362,68 @@ class EdgeTechProcessor:
             or not record.currentState.isDeployed
             or record.currentState.dateRecovered is not None
         )
+
+    @staticmethod
+    def _get_date_recovered_from_change_records(buoy: Buoy) -> Optional[datetime]:
+        """
+        Find the most recent dateRecovered value from a buoy's changeRecords.
+
+        This is needed for re-deployment scenarios where the buoy was hauled and
+        immediately redeployed — the currentState no longer has dateRecovered
+        (cleared by the redeploy), but the changeRecords preserve the haul timestamp.
+
+        Returns:
+            The most recent dateRecovered datetime, or None if not found.
+        """
+        most_recent = None
+        for record in buoy.changeRecords:
+            for change in record.changes:
+                if change.key == "dateRecovered" and change.newValue is not None:
+                    try:
+                        recovered_dt = datetime.fromisoformat(
+                            str(change.newValue).replace("Z", "+00:00")
+                        )
+                        if most_recent is None or recovered_dt > most_recent:
+                            most_recent = recovered_dt
+                    except (ValueError, TypeError):
+                        continue
+        return most_recent
+
+    @staticmethod
+    def _get_recovery_location_from_change_records(
+        buoy: Buoy,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Find the most recent recovery location from a buoy's changeRecords.
+
+        Needed for re-deployment scenarios where recoveredLatDeg/recoveredLonDeg
+        in currentState were cleared by the redeploy.
+
+        Returns:
+            Tuple of (latitude, longitude) or (None, None) if not found.
+        """
+        # Find the changeRecord that set dateRecovered most recently —
+        # its sibling entries will have the recovery coordinates.
+        best_timestamp = None
+        best_lat = None
+        best_lon = None
+        for record in buoy.changeRecords:
+            lat = None
+            lon = None
+            has_recovery = False
+            for change in record.changes:
+                if change.key == "dateRecovered" and change.newValue is not None:
+                    has_recovery = True
+                elif change.key == "recoveredLatDeg" and change.newValue is not None:
+                    lat = change.newValue
+                elif change.key == "recoveredLonDeg" and change.newValue is not None:
+                    lon = change.newValue
+            if has_recovery and lat is not None and lon is not None:
+                if best_timestamp is None or record.timestamp > best_timestamp:
+                    best_timestamp = record.timestamp
+                    best_lat = lat
+                    best_lon = lon
+        return best_lat, best_lon
 
     def _should_skip_buoy(self, record: Buoy) -> Tuple[bool, Optional[str]]:
         """
@@ -408,9 +529,11 @@ class EdgeTechProcessor:
         if a haul event should be generated, rather than inferring hauling from absence in the dataset.
 
         Process:
-        - `to_deploy`: Buoys that are deployed in EdgeTech but not yet in ER.
+        - `to_deploy`: Buoys that are deployed in EdgeTech but not yet in ER, or re-deployments
+          (EdgeTech dateDeployed newer than ER gear's deployment: haul existing then deploy new).
         - `to_update`: Buoys that exist in ER and have changes (location, status, or newer data).
-        - `to_haul`: Buoys that are explicitly marked as deleted or not deployed in EdgeTech.
+        - `to_haul`: Buoys that are explicitly marked as deleted or not deployed in EdgeTech, or re-deployments
+          (close existing gear before new deployment).
 
         Args:
             er_gears_devices_id_to_gear (Dict[str, BuoyGear]): Mapping of ER device IDs to gear objects.
@@ -477,8 +600,54 @@ class EdgeTechProcessor:
                         logger.info(
                             f"Buoy {serial_number_user_id} already hauled in ER, skipping"
                         )
+                elif (
+                    er_gear.status != "deployed"
+                    and edgetech_buoy.currentState.isDeployed
+                ):
+                    # ER gear was hauled (e.g. previous re-deployment haul succeeded
+                    # but the deploy failed), and EdgeTech shows it as deployed now.
+                    # Treat as a new deployment so the gear gets created in ER.
+                    to_deploy.add(serial_number_user_id)
+                    logger.info(
+                        f"Buoy {serial_number_user_id} marked for deployment "
+                        f"(ER gear status={er_gear.status} but EdgeTech isDeployed=True; "
+                        f"recovering missed deployment)"
+                    )
                 else:
-                    # Buoy is still deployed - check if it needs updating
+                    # Buoy is still deployed - check for re-deployment first (new deployment
+                    # with same serials: close previous gear and create new one)
+                    er_gear_deployment_dates = [
+                        d.last_deployed
+                        for d in er_gear.devices
+                        if isinstance(getattr(d, "last_deployed", None), datetime)
+                    ]
+                    er_gear_deployment_date = (
+                        min(er_gear_deployment_dates)
+                        if er_gear_deployment_dates
+                        else None
+                    )
+                    edgetech_date_deployed = edgetech_buoy.currentState.dateDeployed
+                    # Re-deployment: EdgeTech dateDeployed is meaningfully later than ER's
+                    # (e.g. same units deployed again). Use 1-minute threshold to avoid
+                    # treating microsecond/timestamp precision differences as re-deploy.
+                    is_redeployment = (
+                        er_gear_deployment_date is not None
+                        and edgetech_date_deployed is not None
+                        and (edgetech_date_deployed - er_gear_deployment_date)
+                        > timedelta(minutes=1)
+                        and er_gear.status == "deployed"
+                    )
+                    if is_redeployment:
+                        to_haul.add(serial_number_user_id)
+                        to_deploy.add(serial_number_user_id)
+                        logger.info(
+                            f"Buoy {serial_number_user_id} marked for re-deployment "
+                            f"(EdgeTech dateDeployed={edgetech_date_deployed} > ER gear deployment "
+                            f"{er_gear_deployment_date}); will haul existing gear then deploy new."
+                        )
+                        continue
+
+                    # Check if it needs updating (location or newer data)
                     edgetech_buoy_current_location = (
                         edgetech_buoy.currentState.latDeg,
                         edgetech_buoy.currentState.lonDeg,
@@ -538,6 +707,57 @@ class EdgeTechProcessor:
 
         return to_deploy, to_haul, to_update
 
+    def _get_circular_two_unit_start_keys_to_skip(
+        self, serial_number_to_edgetech_buoy: Dict[str, Buoy]
+    ) -> Set[str]:
+        """
+        Detect circular two-unit line configs: same two devices each configured as
+        start unit with the other as end (e.g. A.endUnit=B and B.endUnit=A). That
+        would create two gearsets for one physical pair. We keep one canonical
+        start (lower serial number) and skip the other.
+
+        Returns:
+            Set of buoy keys (serialNumber/hashedUserId) to skip when processing
+            deployments/updates for two-unit lines.
+        """
+        skip_keys: Set[str] = set()
+        seen_pairs: Set[Tuple[str, str]] = set()  # (min_serial, max_serial) for dedup
+
+        for buoy in serial_number_to_edgetech_buoy.values():
+            if not buoy.currentState.isTwoUnitLine or not buoy.currentState.endUnit:
+                continue
+            if buoy.currentState.startUnit:
+                continue  # This is an end-unit record, not a start
+            partner_serial = buoy.currentState.endUnit
+            hashed_user_id = get_hashed_user_id(buoy.userId)
+            partner_key = f"{partner_serial}/{hashed_user_id}"
+            partner = serial_number_to_edgetech_buoy.get(partner_key)
+            if not partner or not partner.currentState.isTwoUnitLine:
+                continue
+            # Circular: partner also has endUnit pointing back to this buoy (so both are "start")
+            if partner.currentState.endUnit != buoy.serialNumber:
+                continue
+            if partner.currentState.startUnit:
+                continue  # Partner is end unit, not start; no conflict
+            pair = tuple(sorted([buoy.serialNumber, partner_serial]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            # Skip the one with the larger serial so we have a single canonical gearset
+            skip_serial = max(buoy.serialNumber, partner_serial)
+            skip_key = f"{skip_serial}/{hashed_user_id}"
+            skip_keys.add(skip_key)
+            logger.warning(
+                "Circular two-unit line detected: devices %s and %s each configured as "
+                "start with the other as end. Skipping duplicate start for %s (canonical lead: %s). "
+                "Only one gearset will be created for this pair.",
+                buoy.serialNumber,
+                partner_serial,
+                skip_serial,
+                min(buoy.serialNumber, partner_serial),
+            )
+        return skip_keys
+
     async def process(self) -> List[Dict[str, Any]]:
         """
         Process buoy data to generate gear payloads for the Buoy API.
@@ -551,11 +771,11 @@ class EdgeTechProcessor:
             2. Fetches existing ER gears and creates mappings for efficient lookups.
             3. Fetches all sources once for manufacturer ID to source ID mapping.
             4. Categorizes buoys based on explicit status checks:
-                - Deploy: Buoys marked as deployed in EdgeTech but not yet in ER.
+                - Deploy: Buoys marked as deployed in EdgeTech but not yet in ER, or re-deployments.
                 - Update: Buoys in ER with location changes or newer data from EdgeTech.
-                - Haul: Buoys explicitly marked as deleted or not deployed in EdgeTech
-                        while still showing as deployed in ER.
-            5. Creates gear payloads directly for each operation.
+                - Haul: Buoys explicitly marked as deleted or not deployed in EdgeTech, or re-deployments
+                  (close existing gear so a new deployment can be created).
+            5. Creates gear payloads: hauls first (close old gear), then deployments, then updates.
 
         Important: Absence of a buoy from the sync window does NOT imply it was hauled.
         Haul events are only generated when EdgeTech explicitly marks a buoy as deleted
@@ -583,6 +803,11 @@ class EdgeTechProcessor:
             f"Processing {len(serial_number_to_edgetech_buoy)} buoys from EdgeTech sync window"
         )
 
+        # Detect circular two-unit configs (same pair each as start) and skip duplicate
+        circular_two_unit_skip_keys = self._get_circular_two_unit_start_keys_to_skip(
+            serial_number_to_edgetech_buoy
+        )
+
         # Fetch all sources once and create a mapping for efficient lookups
         logger.info("Fetching all sources from Buoy API...")
         sources = await self._er_client.get_sources(params={"page_size": 10000})
@@ -608,6 +833,58 @@ class EdgeTechProcessor:
 
         gear_payloads = []
 
+        # Process hauls first (so re-deployments close old gear before creating new)
+        haul_gears_processed = set()
+
+        for serial_number_user_id in to_haul:
+            serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
+            primary_device_name = f"{serial_number}_{hashed_user_id}_A"
+            single_device_name = f"{serial_number}_{hashed_user_id}"
+
+            # Get the EdgeTech buoy data for potential recovery location
+            edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
+
+            # Find the corresponding ER gear
+            er_gear = er_gears_devices_id_to_gear.get(
+                primary_device_name
+            ) or er_gears_devices_id_to_gear.get(single_device_name)
+
+            if not er_gear:
+                logger.warning(
+                    "No ER gear found for buoy %s (tried %s and %s), skipping haul.",
+                    serial_number_user_id,
+                    primary_device_name,
+                    single_device_name,
+                )
+                continue
+
+            # Skip if we already processed this gear set
+            if er_gear.display_id in haul_gears_processed:
+                logger.info(
+                    f"Gear set {er_gear.display_id} already processed for haul, "
+                    f"skipping buoy {serial_number_user_id}"
+                )
+                continue
+
+            try:
+                payload = self._create_haul_payload(
+                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
+                )
+                gear_payloads.append(payload)
+                haul_gears_processed.add(er_gear.display_id)
+                logger.info(
+                    f"Created haul payload for gear set {er_gear.display_id} "
+                    f"(buoy {serial_number_user_id})"
+                )
+
+            except Exception as e:
+                logger.exception(
+                    "Failed to create haul payload for gear set %s (buoy %s). Error: %s",
+                    er_gear.display_id if er_gear else "unknown",
+                    serial_number_user_id,
+                    str(e),
+                )
+
         # Process deployments (new gear sets)
         for serial_number_user_id in to_deploy:
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
@@ -615,6 +892,7 @@ class EdgeTechProcessor:
             try:
                 # Get end unit buoy if this is a two-unit line
                 end_unit_buoy = None
+                end_unit_device_from_er = None
                 if (
                     edgetech_buoy.currentState.isTwoUnitLine
                     and edgetech_buoy.currentState.endUnit
@@ -625,15 +903,48 @@ class EdgeTechProcessor:
                     )
 
                     if not end_unit_buoy:
-                        logger.warning(
-                            "End unit buoy %s not found for serial number %s, skipping deployment.",
-                            edgetech_buoy.currentState.endUnit,
-                            serial_number_user_id,
+                        # End unit not in sync window. Try to get it from ER
+                        # (covers re-deployments where haul already happened,
+                        # and recovery deployments where ER gear was hauled).
+                        end_unit_mfr_id = (
+                            f"{edgetech_buoy.currentState.endUnit}"
+                            f"_{get_hashed_user_id(edgetech_buoy.userId)}"
                         )
-                        continue
+                        er_gear = er_gears_devices_id_to_gear.get(
+                            f"{serial_number_user_id.replace('/', '_')}_A"
+                        ) or er_gears_devices_id_to_gear.get(
+                            serial_number_user_id.replace("/", "_")
+                        )
+                        if er_gear:
+                            for er_device in er_gear.devices:
+                                if er_device.mfr_device_id == end_unit_mfr_id:
+                                    end_unit_device_from_er = er_device
+                                    break
+                        if end_unit_device_from_er:
+                            logger.info(
+                                "End unit %s not in sync window; "
+                                "using ER state for deployment of %s",
+                                edgetech_buoy.currentState.endUnit,
+                                serial_number_user_id,
+                            )
+                        else:
+                            logger.warning(
+                                "End unit buoy %s not found for %s, "
+                                "skipping deployment.",
+                                edgetech_buoy.currentState.endUnit,
+                                serial_number_user_id,
+                            )
+                            continue
 
                 if edgetech_buoy.currentState.startUnit:
                     # This record is for the end unit, skip it (will be handled by start unit)
+                    continue
+
+                if serial_number_user_id in circular_two_unit_skip_keys:
+                    logger.warning(
+                        "Skipping deployment for %s (circular two-unit duplicate).",
+                        serial_number_user_id,
+                    )
                     continue
 
                 payload = await self._create_gear_payload(
@@ -641,6 +952,9 @@ class EdgeTechProcessor:
                     device_status="deployed",
                     manufacturer_id_to_source_id=manufacturer_id_to_source_id,
                     end_unit_buoy=end_unit_buoy,
+                    end_unit_device_from_er=(
+                        end_unit_device_from_er if not end_unit_buoy else None
+                    ),
                     include_initial_deployment=True,
                 )
                 gear_payloads.append(payload)
@@ -697,6 +1011,7 @@ class EdgeTechProcessor:
             try:
                 # Get end unit buoy if this is a two-unit line
                 end_unit_buoy = None
+                end_unit_device_from_er = None
                 if edgetech_buoy.currentState.isTwoUnitLine:
                     if edgetech_buoy.currentState.endUnit:
                         end_unit_buoy_key = f"{edgetech_buoy.currentState.endUnit}/{get_hashed_user_id(edgetech_buoy.userId)}"
@@ -705,22 +1020,44 @@ class EdgeTechProcessor:
                         )
 
                         if not end_unit_buoy:
-                            logger.warning(
-                                "End unit buoy %s not found for serial number %s, skipping update.",
+                            # End unit not in sync window (e.g. only start unit had location update).
+                            # Use end unit's current state from ER so we can still push the update.
+                            # Match by mfr_device_id: same format as when we create the payload.
+                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
+                            for er_device in er_gear.devices:
+                                if er_device.mfr_device_id == end_unit_mfr_id:
+                                    end_unit_device_from_er = er_device
+                                    break
+                            if not end_unit_device_from_er:
+                                logger.warning(
+                                    "End unit buoy %s not found and no end unit device in ER gear for %s, skipping update.",
+                                    edgetech_buoy.currentState.endUnit,
+                                    serial_number_user_id,
+                                )
+                                continue
+                            logger.info(
+                                "End unit %s not in sync window; using current state from ER for update of %s",
                                 edgetech_buoy.currentState.endUnit,
                                 serial_number_user_id,
                             )
-                            continue
 
                     if edgetech_buoy.currentState.startUnit:
                         # This record is for the end unit, skip it
                         continue
+
+                if serial_number_user_id in circular_two_unit_skip_keys:
+                    logger.warning(
+                        "Skipping update for %s (circular two-unit duplicate).",
+                        serial_number_user_id,
+                    )
+                    continue
 
                 payload = await self._create_gear_payload(
                     buoy=edgetech_buoy,
                     device_status="deployed",
                     manufacturer_id_to_source_id=manufacturer_id_to_source_id,
                     end_unit_buoy=end_unit_buoy,
+                    end_unit_device_from_er=end_unit_device_from_er,
                     set_id=er_gear.id,
                     include_initial_deployment=False,
                 )
@@ -730,59 +1067,6 @@ class EdgeTechProcessor:
             except Exception as e:
                 logger.exception(
                     "Failed to create gear payload for update %s. Error: %s",
-                    serial_number_user_id,
-                    str(e),
-                )
-
-        # Process hauls (gear sets explicitly marked as deleted or not deployed)
-        # Group devices by gear set to avoid duplicate haul payloads
-        haul_gears_processed = set()
-
-        for serial_number_user_id in to_haul:
-            serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
-            primary_device_name = f"{serial_number}_{hashed_user_id}_A"
-            single_device_name = f"{serial_number}_{hashed_user_id}"
-
-            # Get the EdgeTech buoy data for potential recovery location
-            edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
-
-            # Find the corresponding ER gear
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
-
-            if not er_gear:
-                logger.warning(
-                    "No ER gear found for buoy %s (tried %s and %s), skipping haul.",
-                    serial_number_user_id,
-                    primary_device_name,
-                    single_device_name,
-                )
-                continue
-
-            # Skip if we already processed this gear set
-            if er_gear.display_id in haul_gears_processed:
-                logger.info(
-                    f"Gear set {er_gear.display_id} already processed for haul, "
-                    f"skipping buoy {serial_number_user_id}"
-                )
-                continue
-
-            try:
-                payload = self._create_haul_payload(
-                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
-                )
-                gear_payloads.append(payload)
-                haul_gears_processed.add(er_gear.display_id)
-                logger.info(
-                    f"Created haul payload for gear set {er_gear.display_id} "
-                    f"(buoy {serial_number_user_id})"
-                )
-
-            except Exception as e:
-                logger.exception(
-                    "Failed to create haul payload for gear set %s (buoy %s). Error: %s",
-                    er_gear.display_id if er_gear else "unknown",
                     serial_number_user_id,
                     str(e),
                 )
