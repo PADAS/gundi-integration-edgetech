@@ -129,9 +129,6 @@ class EdgeTechProcessor:
             secondary_last_deployed = (
                 end_unit_buoy.currentState.dateDeployed or last_updated
             )
-            end_unit_last_updated = (
-                end_unit_buoy.currentState.lastUpdated or last_updated
-            )
             # Use same logic as main device for recorded_at
             if include_initial_deployment:
                 secondary_recorded_at = secondary_last_deployed or datetime.now(
@@ -673,8 +670,10 @@ class EdgeTechProcessor:
                     has_newer_data = edgetech_last_updated > er_last_updated
 
                     # No recorded_at dedup check needed here: position-only
-                    # updates now use datetime.now(utc) as recorded_at, so they
-                    # will not collide with previously-accepted observations.
+                    # updates now use _utcnow() as recorded_at, which makes
+                    # collisions with previously-accepted observations unlikely,
+                    # though updates processed within the same second could still
+                    # collide after _remove_milliseconds truncation.
 
                     if location_changed or has_newer_data:
                         to_update.add(serial_number_user_id)

@@ -1415,8 +1415,8 @@ class TestEdgeTechProcessor:
 
         This is the bug fix test: Previously, position updates were incorrectly skipped because
         the code used dateDeployed for recorded_at, and dateDeployed doesn't change on position updates.
-        Now we use datetime.now(utc) for updates, so position changes get a fresh recorded_at
-        that won't collide with previously-accepted observations.
+        Now we use _utcnow() for updates, so position changes get a fresh recorded_at
+        that is unlikely to collide with previously-accepted observations.
         """
         # Create EdgeTech buoy with:
         # - dateDeployed: 22:40:08 (same as ER)
@@ -1503,7 +1503,7 @@ class TestEdgeTechProcessor:
         self, mocker
     ):
         """
-        Test that _create_gear_payload uses datetime.now(utc) for recorded_at
+        Test that _create_gear_payload uses _utcnow() for recorded_at
         when include_initial_deployment=False (i.e., for position updates).
 
         EdgeTech can update latDeg/lonDeg without changing lastUpdated, so
