@@ -50,6 +50,11 @@ class EdgeTechProcessor:
         start_datetime = datetime.now(timezone.utc) - timedelta(minutes=30)
         return {"start_datetime": start_datetime}
 
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Return the current UTC time. Extracted for testability."""
+        return datetime.now(timezone.utc)
+
     def _remove_milliseconds(self, dt: datetime) -> datetime:
         """
         Remove milliseconds from a datetime object.
@@ -91,15 +96,15 @@ class EdgeTechProcessor:
         last_updated = buoy.currentState.lastUpdated
         last_deployed = buoy.currentState.dateDeployed or last_updated
         # For initial deployments, use dateDeployed as recorded_at.
-        # For updates (position changes), use current time so the recorded_at is
-        # always unique.  EdgeTech can update latDeg/lonDeg without changing
-        # lastUpdated, so reusing lastUpdated as recorded_at would collide with
-        # a previously-accepted observation and be rejected by ER's
-        # (device_id, recorded_at) unique constraint.
+        # For updates (position changes), use current time so that recorded_at
+        # differs from previous syncs.  EdgeTech can update latDeg/lonDeg
+        # without changing lastUpdated, so reusing lastUpdated as recorded_at
+        # could collide with a previously-accepted observation and be rejected
+        # by ER's (device_id, recorded_at) unique constraint.
         if include_initial_deployment:
-            deployment_recorded_at = last_deployed or datetime.now(timezone.utc)
+            deployment_recorded_at = last_deployed or self._utcnow()
         else:
-            deployment_recorded_at = datetime.now(timezone.utc)
+            deployment_recorded_at = self._utcnow()
 
         # Create devices list
         devices = []
@@ -133,9 +138,7 @@ class EdgeTechProcessor:
                     timezone.utc
                 )
             else:
-                secondary_recorded_at = end_unit_last_updated or datetime.now(
-                    timezone.utc
-                )
+                secondary_recorded_at = deployment_recorded_at
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
             secondary_device_additional_data.pop("changeRecords", None)
         elif end_unit_device_from_er:
@@ -671,7 +674,7 @@ class EdgeTechProcessor:
 
                     # No recorded_at dedup check needed here: position-only
                     # updates now use datetime.now(utc) as recorded_at, so they
-                    # are always unique and will not be rejected by ER.
+                    # will not collide with previously-accepted observations.
 
                     if location_changed or has_newer_data:
                         to_update.add(serial_number_user_id)
