@@ -131,9 +131,7 @@ class EdgeTechProcessor:
             )
             # Use same logic as main device for recorded_at
             if include_initial_deployment:
-                secondary_recorded_at = secondary_last_deployed or datetime.now(
-                    timezone.utc
-                )
+                secondary_recorded_at = secondary_last_deployed or self._utcnow()
             else:
                 secondary_recorded_at = deployment_recorded_at
             secondary_device_additional_data = json.loads(end_unit_buoy.json())
