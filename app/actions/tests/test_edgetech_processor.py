@@ -1994,3 +1994,100 @@ class TestEdgeTechProcessor:
         assert buoy_key in to_haul
         assert buoy_key in to_deploy
         assert len(to_update) == 0
+
+    def test_redeployment_haul_without_date_recovered_avoids_recorded_at_collision(
+        self,
+    ):
+        """When EdgeTech skips the haul stage (no dateRecovered anywhere) and
+        dateDeployed/lastUpdated fall in the same second, the haul payload must
+        NOT reuse lastUpdated as recorded_at — that would collide with the
+        deploy payload's recorded_at after millisecond truncation."""
+        user_id = "684b1ec1c1df05abfa78b756"
+        serial_number = "88CE99D98B"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        # Real-world data: EdgeTech skipped haul, went straight to new deployment.
+        # dateDeployed and lastUpdated are in the same second.
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": "1774708500700",
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8CDC8B",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4224917,
+                "lonDeg": -70.6649972,
+                "endLatDeg": 42.4268093,
+                "endLonDeg": -70.6696386,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-03-28T14:35:00.167Z",
+                "lastUpdated": "2026-03-28T14:35:00.700Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-28T14:35:00.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-03-05T15:15:45.573Z",
+                            "newValue": "2026-03-28T14:35:00.167Z",
+                        },
+                        {
+                            "key": "latDeg",
+                            "oldValue": 42.4275164,
+                            "newValue": 42.4224917,
+                        },
+                        {
+                            "key": "lonDeg",
+                            "oldValue": -70.6701861,
+                            "newValue": -70.6649972,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4275164, longitude=-70.6701861),
+            last_updated=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-OLD",
+            status="deployed",
+            last_updated=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        # Haul payload for re-deployment (is_redeployment=True)
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        # The haul recorded_at should NOT be lastUpdated (2026-03-28T14:35:00Z after
+        # truncation) because dateDeployed also truncates to the same value, which
+        # would cause the deploy payload to be rejected by ER's unique constraint.
+        haul_recorded_at = haul_payload["devices"][0]["recorded_at"]
+        deploy_recorded_at = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed
+        ).isoformat()
+
+        assert haul_recorded_at != deploy_recorded_at, (
+            f"Haul recorded_at ({haul_recorded_at}) must differ from deploy "
+            f"recorded_at ({deploy_recorded_at}) to avoid ER unique constraint collision"
+        )

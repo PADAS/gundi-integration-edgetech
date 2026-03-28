@@ -231,7 +231,10 @@ class EdgeTechProcessor:
         return payload
 
     def _create_haul_payload(
-        self, er_gear: BuoyGear, edgetech_buoy: Optional[Buoy] = None
+        self,
+        er_gear: BuoyGear,
+        edgetech_buoy: Optional[Buoy] = None,
+        is_redeployment: bool = False,
     ) -> Dict[str, Any]:
         """
         Create a haul payload from an existing ER gear.
@@ -242,6 +245,11 @@ class EdgeTechProcessor:
         Args:
             er_gear: The existing gear from ER
             edgetech_buoy: Optional EdgeTech buoy data with potential recovery location
+            is_redeployment: Whether this haul is part of a re-deployment sequence.
+                When True and no dateRecovered is found, keeps datetime.now() as
+                recorded_at instead of falling back to lastUpdated, which could
+                collide with the subsequent deploy payload's recorded_at after
+                millisecond truncation.
 
         Returns:
             Dict in the format expected by /api/v1/gear/ POST endpoint
@@ -274,7 +282,11 @@ class EdgeTechProcessor:
                         f"Using dateRecovered from changeRecords for haul of "
                         f"{edgetech_buoy.serialNumber}: {recovered_at_from_changes}"
                     )
-                elif edgetech_buoy.currentState.lastUpdated:
+                elif not is_redeployment and edgetech_buoy.currentState.lastUpdated:
+                    # For non-redeployment hauls, lastUpdated reflects the haul.
+                    # For re-deployments, lastUpdated reflects the NEW deployment
+                    # and would collide with the deploy payload's recorded_at
+                    # after millisecond truncation — keep datetime.now() instead.
                     haul_recorded_at = edgetech_buoy.currentState.lastUpdated
 
         if edgetech_buoy:
@@ -847,7 +859,9 @@ class EdgeTechProcessor:
 
             try:
                 payload = self._create_haul_payload(
-                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
+                    er_gear=er_gear,
+                    edgetech_buoy=edgetech_buoy,
+                    is_redeployment=serial_number_user_id in to_deploy,
                 )
                 gear_payloads.append(payload)
                 haul_gears_processed.add(er_gear.display_id)
