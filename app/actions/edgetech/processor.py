@@ -265,7 +265,7 @@ class EdgeTechProcessor:
         # Use dateRecovered if available; for re-deployments (haul then immediate
         # redeploy) the currentState dateRecovered is cleared, so check changeRecords
         # for the most recent dateRecovered value. Fall back to lastUpdated.
-        haul_recorded_at = datetime.now(timezone.utc)
+        haul_recorded_at = self._utcnow()
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
                 haul_recorded_at = edgetech_buoy.currentState.dateRecovered
@@ -282,11 +282,16 @@ class EdgeTechProcessor:
                         f"Using dateRecovered from changeRecords for haul of "
                         f"{edgetech_buoy.serialNumber}: {recovered_at_from_changes}"
                     )
-                elif not is_redeployment and edgetech_buoy.currentState.lastUpdated:
-                    # For non-redeployment hauls, lastUpdated reflects the haul.
-                    # For re-deployments, lastUpdated reflects the NEW deployment
-                    # and would collide with the deploy payload's recorded_at
-                    # after millisecond truncation — keep datetime.now() instead.
+                elif is_redeployment and edgetech_buoy.currentState.dateDeployed:
+                    # For re-deployments without dateRecovered, lastUpdated and
+                    # dateDeployed are typically in the same second (both reflect
+                    # the new deployment). Use dateDeployed - 1s as a deterministic
+                    # haul timestamp that is guaranteed not to collide with the
+                    # deploy payload's recorded_at after millisecond truncation.
+                    haul_recorded_at = (
+                        edgetech_buoy.currentState.dateDeployed - timedelta(seconds=1)
+                    )
+                elif edgetech_buoy.currentState.lastUpdated:
                     haul_recorded_at = edgetech_buoy.currentState.lastUpdated
 
         if edgetech_buoy:

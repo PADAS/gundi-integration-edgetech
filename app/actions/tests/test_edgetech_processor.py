@@ -2079,14 +2079,20 @@ class TestEdgeTechProcessor:
             er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
         )
 
-        # The haul recorded_at should NOT be lastUpdated (2026-03-28T14:35:00Z after
-        # truncation) because dateDeployed also truncates to the same value, which
-        # would cause the deploy payload to be rejected by ER's unique constraint.
+        # The haul recorded_at should be dateDeployed - 1s (deterministic, no
+        # collision with the deploy payload's recorded_at after truncation).
         haul_recorded_at = haul_payload["devices"][0]["recorded_at"]
         deploy_recorded_at = processor._remove_milliseconds(
             buoy.currentState.dateDeployed
         ).isoformat()
+        expected_haul_recorded_at = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed - timedelta(seconds=1)
+        ).isoformat()
 
+        assert haul_recorded_at == expected_haul_recorded_at, (
+            f"Haul recorded_at ({haul_recorded_at}) must be dateDeployed - 1s "
+            f"({expected_haul_recorded_at})"
+        )
         assert haul_recorded_at != deploy_recorded_at, (
             f"Haul recorded_at ({haul_recorded_at}) must differ from deploy "
             f"recorded_at ({deploy_recorded_at}) to avoid ER unique constraint collision"
