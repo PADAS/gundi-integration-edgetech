@@ -246,10 +246,10 @@ class EdgeTechProcessor:
             er_gear: The existing gear from ER
             edgetech_buoy: Optional EdgeTech buoy data with potential recovery location
             is_redeployment: Whether this haul is part of a re-deployment sequence.
-                When True and no dateRecovered is found, keeps datetime.now() as
-                recorded_at instead of falling back to lastUpdated, which could
-                collide with the subsequent deploy payload's recorded_at after
-                millisecond truncation.
+                When True and no dateRecovered is found, uses dateDeployed - 1s
+                as a deterministic recorded_at instead of falling back to
+                lastUpdated, which could collide with the subsequent deploy
+                payload's recorded_at after millisecond truncation.
 
         Returns:
             Dict in the format expected by /api/v1/gear/ POST endpoint
@@ -262,9 +262,8 @@ class EdgeTechProcessor:
         recovery_lon = None
 
         # Determine the recorded_at timestamp for the haul event
-        # Use dateRecovered if available; for re-deployments (haul then immediate
-        # redeploy) the currentState dateRecovered is cleared, so check changeRecords
-        # for the most recent dateRecovered value. Fall back to lastUpdated.
+        # Priority: dateRecovered from currentState → dateRecovered from changeRecords
+        # → dateDeployed - 1s (re-deployments without dateRecovered) → lastUpdated.
         haul_recorded_at = self._utcnow()
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
@@ -340,9 +339,7 @@ class EdgeTechProcessor:
                     if device.last_deployed
                     else device.last_updated.isoformat()
                 ),
-                "last_updated": self._remove_milliseconds(
-                    datetime.now(timezone.utc)
-                ).isoformat(),
+                "last_updated": self._remove_milliseconds(self._utcnow()).isoformat(),
                 "recorded_at": self._remove_milliseconds(haul_recorded_at).isoformat(),
                 "device_status": "hauled",
                 "location": {
