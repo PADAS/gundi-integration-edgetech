@@ -2097,3 +2097,157 @@ class TestEdgeTechProcessor:
             f"Haul recorded_at ({haul_recorded_at}) must differ from deploy "
             f"recorded_at ({deploy_recorded_at}) to avoid ER unique constraint collision"
         )
+
+    def test_redeployment_ignores_stale_date_recovered_from_prior_lifecycle(self):
+        """When changeRecords contain a dateRecovered from a *previous* deploy/haul
+        lifecycle (before the current ER gear was even deployed), the haul payload
+        must NOT use that stale value.  It should fall through to dateDeployed - 1s.
+
+        Real-world scenario:
+          1. Deploy at March 16
+          2. Haul at April 10  (dateRecovered = April 10 19:32:59)
+          3. Deploy at April 13 19:05  (clears dateRecovered)
+          4. Re-deploy at April 13 19:09  (dateDeployed 19:05 → 19:09)
+
+        When processing step 4, the haul for the 19:05 gear must NOT use the
+        April 10 dateRecovered — that belongs to the March 16 gear's lifecycle.
+        """
+        user_id = "6228fab6b9923b00705ba333"
+        serial_number = "1234567890"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1776107382734"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "1234567899",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 41.749466138317125,
+                "lonDeg": -70.74163437237308,
+                "endLatDeg": 41.74948039627152,
+                "endLonDeg": -70.741625073152,
+                "modelNumber": "1234",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-13T19:09:28.998Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-13T19:09:42.734Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-13T19:09:42.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-04-13T19:05:54.435Z",
+                            "newValue": "2026-04-13T19:09:28.998Z",
+                        },
+                        {
+                            "key": "lastUpdated",
+                            "oldValue": "2026-04-13T19:05:54.950Z",
+                            "newValue": "2026-04-13T19:09:42.734Z",
+                        },
+                    ],
+                },
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-13T19:05:54.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": None,
+                            "newValue": "2026-04-13T19:05:54.435Z",
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": "2026-04-10T19:32:59.960Z",
+                            "newValue": None,
+                        },
+                        {"key": "isDeployed", "oldValue": False, "newValue": True},
+                    ],
+                },
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-10T19:33:00.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-03-16T20:36:10.316Z",
+                            "newValue": None,
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-04-10T19:32:59.960Z",
+                        },
+                        {"key": "isDeployed", "oldValue": True, "newValue": False},
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": None,
+                            "newValue": 41.70440105394446,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": None,
+                            "newValue": -70.58701236527317,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        # ER gear from the 19:05 deployment
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(
+                latitude=41.749452004389454, longitude=-70.7414179924815
+            ),
+            last_updated=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-1905",
+            status="deployed",
+            last_updated=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        haul_recorded_at = haul_payload["devices"][0]["recorded_at"]
+
+        # Must be dateDeployed - 1s (2026-04-13T19:09:27), NOT the stale
+        # April 10 dateRecovered from the prior lifecycle
+        expected = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed - timedelta(seconds=1)
+        ).isoformat()
+        stale_april_10 = "2026-04-10T19:32:59+00:00"
+
+        assert haul_recorded_at != stale_april_10, (
+            f"Haul recorded_at ({haul_recorded_at}) must NOT use the stale "
+            f"April 10 dateRecovered from a prior lifecycle"
+        )
+        assert haul_recorded_at == expected, (
+            f"Haul recorded_at ({haul_recorded_at}) should be dateDeployed - 1s "
+            f"({expected})"
+        )
+
+        # Recovery location should NOT come from the stale April 10 changeRecord;
+        # it should fall back to the ER device's deployed location
+        assert haul_payload["devices"][0]["location"]["latitude"] == 41.749452004389454
+        assert haul_payload["devices"][0]["location"]["longitude"] == -70.7414179924815
