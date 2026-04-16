@@ -416,6 +416,11 @@ class EdgeTechProcessor:
         Returns:
             The most recent dateRecovered datetime, or None if not found.
         """
+        # recovered_dt is always tz-aware (we append +00:00), but min_date can
+        # come from BuoyDevice.last_deployed which pydantic does not coerce to
+        # tz-aware. Normalize naive → UTC to avoid a TypeError on comparison.
+        if min_date is not None and min_date.tzinfo is None:
+            min_date = min_date.replace(tzinfo=timezone.utc)
         most_recent = None
         for record in buoy.changeRecords:
             for change in record.changes:
@@ -452,6 +457,11 @@ class EdgeTechProcessor:
         Returns:
             Tuple of (latitude, longitude) or (None, None) if not found.
         """
+        # recovered_dt is always tz-aware (we append +00:00), but min_date can
+        # come from BuoyDevice.last_deployed which pydantic does not coerce to
+        # tz-aware. Normalize naive → UTC to avoid a TypeError on comparison.
+        if min_date is not None and min_date.tzinfo is None:
+            min_date = min_date.replace(tzinfo=timezone.utc)
         # Find the changeRecord that set dateRecovered most recently —
         # its sibling entries will have the recovery coordinates.
         best_timestamp = None

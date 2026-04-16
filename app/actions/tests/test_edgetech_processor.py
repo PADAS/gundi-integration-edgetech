@@ -2373,3 +2373,67 @@ class TestEdgeTechProcessor:
             f"Expected no new deployment, got {len(deploy_payloads)}: "
             f"{deploy_payloads}"
         )
+
+    def test_change_record_helpers_accept_naive_min_date(self):
+        """BuoyDevice.last_deployed is not coerced to tz-aware, so min_date
+        passed into the change-record helpers can be naive. The helpers must
+        normalize before comparing against the tz-aware recovered_dt —
+        otherwise Python raises TypeError on naive vs aware comparison."""
+        buoy_data = {
+            "serialNumber": "88CE99D358",
+            "userId": "6846e8f6e0488a09f1d5b39a",
+            "currentState": {
+                "etag": '"x"',
+                "isDeleted": False,
+                "serialNumber": "88CE99D358",
+                "releaseCommand": "C8AB8C7658",
+                "statusCommand": "88CE99D358",
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4476378,
+                "lonDeg": -70.608329,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-16T10:43:04.182Z",
+                "lastUpdated": "2026-04-16T10:43:04.788Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-16T10:34:35.000Z",
+                    "changes": [
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-04-16T09:54:07.949Z",
+                        },
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": None,
+                            "newValue": 42.4992445,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": None,
+                            "newValue": -70.8112983,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        # Naive datetime — simulates an ER device whose last_deployed wasn't
+        # coerced to tz-aware.
+        naive_min = datetime(2026, 4, 9, 14, 17, 56)
+
+        # Should not raise TypeError
+        result = EdgeTechProcessor._get_date_recovered_from_change_records(
+            buoy, min_date=naive_min
+        )
+        assert result == datetime(2026, 4, 16, 9, 54, 7, 949000, tzinfo=timezone.utc)
+
+        lat, lon = EdgeTechProcessor._get_recovery_location_from_change_records(
+            buoy, min_date=naive_min
+        )
+        assert lat == 42.4992445
+        assert lon == -70.8112983
