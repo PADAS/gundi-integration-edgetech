@@ -858,9 +858,27 @@ class EdgeTechProcessor:
         logger.info("Fetching all gears from EarthRanger...")
         er_gears = await self._er_client.get_er_gears(params={"page_size": 10000})
 
-        er_gears_devices_id_to_gear = {
-            device.mfr_device_id: gear for gear in er_gears for device in gear.devices
-        }
+        # Multiple ER gears can share a mfr_device_id (e.g. a hauled gear from a
+        # prior lifecycle plus a currently-deployed gear). Prefer the deployed
+        # gear; among same-status gears, prefer the most recently updated.
+        # Without this, a leftover hauled gear could win the lookup and trick
+        # _identify_buoys into creating a duplicate deployment.
+        er_gears_devices_id_to_gear: Dict[str, BuoyGear] = {}
+        for gear in er_gears:
+            for device in gear.devices:
+                existing = er_gears_devices_id_to_gear.get(device.mfr_device_id)
+                if existing is None:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
+                    continue
+                existing_deployed = existing.status == "deployed"
+                gear_deployed = gear.status == "deployed"
+                if existing_deployed and not gear_deployed:
+                    continue
+                if gear_deployed and not existing_deployed:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
+                    continue
+                if gear.last_updated > existing.last_updated:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
 
         to_deploy, to_haul, to_update = await self._identify_buoys(
             er_gears_devices_id_to_gear,

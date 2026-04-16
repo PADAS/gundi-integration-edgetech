@@ -2251,3 +2251,125 @@ class TestEdgeTechProcessor:
         # it should fall back to the ER device's deployed location
         assert haul_payload["devices"][0]["location"]["latitude"] == 41.749452004389454
         assert haul_payload["devices"][0]["location"]["longitude"] == -70.7414179924815
+
+    @pytest.mark.asyncio
+    async def test_process_prefers_deployed_gear_over_hauled_for_same_device(self):
+        """When ER returns multiple gears sharing a mfr_device_id (e.g. a hauled
+        gear from a prior lifecycle plus a currently-deployed gear from the
+        latest re-deploy), the lookup must pick the deployed one. Otherwise the
+        hauled gear can win, _identify_buoys falls into the
+        ``status != 'deployed' and isDeployed`` branch, and a duplicate
+        gearset is created.
+        """
+        user_id = "6846e8f6e0488a09f1d5b39a"
+        serial_number = "88CE99D358"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        # EdgeTech currentState reflects the latest re-deploy; same dateDeployed
+        # as the deployed ER gear (no re-deployment, no update needed).
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1776336184788"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8C7658",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4476378,
+                "lonDeg": -70.608329,
+                "endLatDeg": 42.455983,
+                "endLonDeg": -70.616863,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-16T10:43:04.182Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-16T10:43:04.788Z",
+            },
+            "changeRecords": [],
+        }
+
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        device_id_b = f"{serial_number}_{hashed_user_id}_B"
+
+        # Hauled gear from a prior lifecycle (same device serials).
+        hauled_device_a = BuoyDevice(
+            device_id="old-uuid-a",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4487014, longitude=-70.6094034),
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 9, 14, 17, 56, tzinfo=timezone.utc),
+        )
+        hauled_device_b = BuoyDevice(
+            device_id="old-uuid-b",
+            mfr_device_id=device_id_b,
+            label="Device B",
+            location=DeviceLocation(latitude=42.4557331, longitude=-70.6168107),
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 9, 14, 17, 56, tzinfo=timezone.utc),
+        )
+        hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-APRIL-9",
+            status="hauled",
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            devices=[hauled_device_a, hauled_device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        # Currently-deployed gear from the April 16 re-deploy.
+        deployed_device_a = BuoyDevice(
+            device_id="new-uuid-a",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4476378, longitude=-70.608329),
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+        )
+        deployed_device_b = BuoyDevice(
+            device_id="new-uuid-b",
+            mfr_device_id=device_id_b,
+            label="Device B",
+            location=DeviceLocation(latitude=42.455983, longitude=-70.616863),
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+        )
+        deployed_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-APRIL-16",
+            status="deployed",
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            devices=[deployed_device_a, deployed_device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        # Deployed gear listed first, hauled gear last — without the dedup
+        # logic, the hauled gear (last write wins in a dict comprehension)
+        # would clobber the deployed entry and trigger a duplicate deployment.
+        mock_er_client = Mock()
+        mock_er_client.get_er_gears = AsyncMock(
+            return_value=[deployed_gear, hauled_gear]
+        )
+        mock_er_client.get_sources = AsyncMock(return_value=[])
+        processor._er_client = mock_er_client
+
+        gear_payloads = await processor.process()
+
+        # No deployment payload should be generated; the deployed April 16 gear
+        # already matches the EdgeTech currentState.
+        deploy_payloads = [
+            p
+            for p in gear_payloads
+            if any(d.get("device_status") == "deployed" for d in p.get("devices", []))
+            and "initial_deployment_date" in p
+        ]
+        assert deploy_payloads == [], (
+            f"Expected no new deployment, got {len(deploy_payloads)}: "
+            f"{deploy_payloads}"
+        )
