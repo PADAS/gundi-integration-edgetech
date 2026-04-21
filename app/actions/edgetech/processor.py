@@ -885,19 +885,37 @@ class EdgeTechProcessor:
             serial_number_to_edgetech_buoy
         )
 
-        # Fetch all sources once and create a mapping for efficient lookups
-        logger.info("Fetching all sources from Buoy API...")
-        sources = await self._er_client.get_sources(params={"page_size": 10000})
-        manufacturer_id_to_source_id = {
-            source.get("manufacturer_id"): source.get("id")
-            for source in sources
-            if source.get("manufacturer_id")
-        }
-        logger.info(f"Loaded {len(manufacturer_id_to_source_id)} source mappings")
+        # Fetch all existing gears from ER to compare against EdgeTech data.
+        # The /gear/ endpoint defaults to state=deployed, so hauled gears must
+        # be requested explicitly — we need them both for the source-ID map
+        # (re-deployments reuse source UUIDs that live on the previously-hauled
+        # gear) and for the hauled-vs-deployed dedup below (line ~908).
+        logger.info("Fetching all gears from EarthRanger (deployed + hauled)...")
+        deployed_gears = await self._er_client.get_er_gears(
+            params={"page_size": 10000}, state="deployed"
+        )
+        hauled_gears = await self._er_client.get_er_gears(
+            params={"page_size": 10000}, state="hauled"
+        )
+        er_gears = deployed_gears + hauled_gears
+        logger.info(
+            f"Fetched {len(deployed_gears)} deployed and {len(hauled_gears)} "
+            f"hauled gears from EarthRanger"
+        )
 
-        # Fetch all existing gears from ER to compare against EdgeTech data
-        logger.info("Fetching all gears from EarthRanger...")
-        er_gears = await self._er_client.get_er_gears(params={"page_size": 10000})
+        # Build mfr_device_id → source UUID map from gear devices across both
+        # states. Avoids a separate /sources/ call that would require extra
+        # permissions. If the same mfr_device_id appears on multiple gears
+        # (e.g. hauled-then-redeployed), every occurrence maps to the same
+        # underlying source UUID, so dict overwrite is fine.
+        manufacturer_id_to_source_id = {
+            device.mfr_device_id: device.device_id
+            for gear in er_gears
+            for device in gear.devices
+        }
+        logger.info(
+            f"Derived {len(manufacturer_id_to_source_id)} source mappings from ER gears"
+        )
 
         # Multiple ER gears can share a mfr_device_id (e.g. a hauled gear from a
         # prior lifecycle plus a currently-deployed gear). Prefer the deployed

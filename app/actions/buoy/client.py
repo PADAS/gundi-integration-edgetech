@@ -21,14 +21,32 @@ class BuoyClient:
     async def get_er_gears(
         self,
         params: Optional[dict] = None,
+        state: Optional[str] = None,
     ) -> List[BuoyGear]:
-        url = f"{self.er_site}api/v1.0/gear/?include_empty_location=true"
+        """Fetch gears from the Buoy API.
+
+        The /gear/ endpoint defaults to state=deployed, so hauled gears are
+        silently excluded unless the caller asks for them explicitly. Callers
+        that need the full source-ID map (or that compare against hauled
+        lifecycle data) must request both states.
+
+        Args:
+            params: Extra query parameters (e.g. page_size).
+            state: Optional `state` filter value forwarded as-is — typically
+                "deployed" or "hauled". When None, the server default
+                (deployed-only) applies.
+        """
+        url = f"{self.er_site}api/v1.0/gear/"
+        query_params = dict(params) if params else {}
+        query_params["include_empty_location"] = "true"
+        if state:
+            query_params["state"] = state
         items = []
 
         async with aiohttp.ClientSession() as session:
             while url:
                 async with session.get(
-                    url, headers=self.headers, params=params
+                    url, headers=self.headers, params=query_params
                 ) as response:
                     if response.status != 200:
                         body = await response.text()
@@ -55,6 +73,9 @@ class BuoyClient:
                     items.extend(results)
 
                     url = page_data.get("next")
+                    # Subsequent pagination URLs already encode the query
+                    # string; re-sending `params` would double it up.
+                    query_params = None
 
         if len(items) == 0:
             logger.warning("No gears found in Buoy API")
@@ -64,7 +85,9 @@ class BuoyClient:
             try:
                 buoy = BuoyGear.parse_obj(item)
             except Exception as e:
-                raise RuntimeError(f"Error parsing gear item: {e} (item: {json.dumps(item)})")
+                raise RuntimeError(
+                    f"Error parsing gear item: {e} (item: {json.dumps(item)})"
+                )
             if buoy.manufacturer.lower() != "edgetech":
                 continue
             buoy.last_updated = buoy.last_updated.astimezone(timezone.utc)
@@ -72,7 +95,9 @@ class BuoyClient:
 
         return gears
 
-    async def send_gear_to_buoy_api(self, gear_payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def send_gear_to_buoy_api(
+        self, gear_payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """
         Send gear payload to the Buoy API POST endpoint.
 
@@ -90,87 +115,28 @@ class BuoyClient:
 
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.post(url, json=gear_payload, headers=headers) as response:
+                async with session.post(
+                    url, json=gear_payload, headers=headers
+                ) as response:
                     response_text = await response.text()
                     if response.status in [200, 201]:
-                        logger.info(f"Successfully sent gear set to Buoy API: {response.status}")
-                        return {"status": "success", "status_code": response.status, "response": response_text}
+                        logger.info(
+                            f"Successfully sent gear set to Buoy API: {response.status}"
+                        )
+                        return {
+                            "status": "success",
+                            "status_code": response.status,
+                            "response": response_text,
+                        }
                     else:
                         logger.error(
                             f"Failed to send gear set to Buoy API. Status: {response.status}, Response: {response_text}"
                         )
-                        return {"status": "error", "status_code": response.status, "response": response_text}
+                        return {
+                            "status": "error",
+                            "status_code": response.status,
+                            "response": response_text,
+                        }
             except Exception as e:
                 logger.exception(f"Exception while sending gear to Buoy API")
                 return {"status": "error", "error": str(e)}
-
-    async def get_existing_source_id_by_manufacturer_id(self, manufacturer_id: str) -> Optional[str]:
-        """
-        Check if a source with the given manufacturer device ID exists in Buoy.
-
-        Args:
-            manufacturer_id: The manufacturer device ID to check.
-
-        Returns:
-            The source ID if found, else None.
-        """
-        try:
-            sources = await self.get_sources()
-            
-            for source in sources:
-                if source.get("manufacturer_id") == manufacturer_id:
-                    source_id = source.get("id")
-                    logger.info(f"Found existing source with manufacturer_id '{manufacturer_id}': {source_id}")
-                    return source_id
-            
-            logger.info(f"No source found with manufacturer_id '{manufacturer_id}'")
-            return None
-            
-        except Exception as e:
-            logger.exception(f"Error checking for existing source with manufacturer_id '{manufacturer_id}': {e}")
-            return None
-        
-    async def get_sources(self, params: Optional[dict] = None) -> List[Dict[str, Any]]:
-        """
-        Get all sources from the Buoy API with pagination support.
-
-        Args:
-            params: Optional query parameters for the request.
-
-        Returns:
-            List of source dictionaries.
-        """
-        url = f"{self.er_site}api/v1.0/sources/"
-        sources = []
-
-        async with aiohttp.ClientSession() as session:
-            while url:
-                async with session.get(url, headers=self.headers, params=params) as response:
-                    if response.status != 200:
-                        logger.error(
-                            f"Failed to fetch sources. Status code: {response.status} Body: {await response.text()}"
-                        )
-                        break
-
-                    data = await response.json()
-
-                    if "data" not in data:
-                        logger.error("Unexpected response structure")
-                        break
-
-                    page_data = data["data"]
-
-                    if "results" not in page_data:
-                        logger.error("No results field in response")
-                        break
-
-                    results = page_data["results"]
-                    sources.extend(results)
-
-                    url = page_data.get("next")
-                    params = None
-
-        if len(sources) == 0:
-            logger.warning("No sources found")
-
-        return sources

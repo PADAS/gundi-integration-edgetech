@@ -463,17 +463,18 @@ Case 2 - Found in ER with id="abc-123-def":
 
 ### Source ID Mapping
 
-For device-level tracking, the system also maintains a mapping from manufacturer device IDs to ER source IDs:
+For device-level tracking, the system maintains a mapping from manufacturer device IDs to ER source IDs. The map is derived from the gear-fetch response (each device on each gear carries both `mfr_device_id` and `device_id`), so no separate `/sources/` call is needed:
 
 ```python
-sources = await er_client.get_sources()  # GET /api/v1.0/sources/
+er_gears = await er_client.get_er_gears()  # GET /api/v1.0/gear/
 manufacturer_id_to_source_id = {
-    source["manufacturer_id"]: source["id"]
-    for source in sources
+    device.mfr_device_id: device.device_id
+    for gear in er_gears
+    for device in gear.devices
 }
 ```
 
-This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones.
+This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones. Sources that are not attached to any gear (orphans from a failed deploy) will not appear in the map; the next deploy for that `mfr_device_id` will mint a new source UUID.
 
 ---
 
@@ -1113,9 +1114,8 @@ await log_action_activity(
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1.0/gear/` | GET | List existing buoy gears (filtered by manufacturer=edgetech) |
+| `/api/v1.0/gear/` | GET | List existing buoy gears (filtered by manufacturer=edgetech); source map is derived from the embedded device list |
 | `/api/v1.0/gear/` | POST | Create or update gear sets |
-| `/api/v1.0/sources/` | GET | List existing sources (for device_id mapping) |
 
 ### Response Codes
 

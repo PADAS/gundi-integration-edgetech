@@ -185,11 +185,9 @@ class TestBuoyClient:
         # Verify the session.get was called with correct parameters
         assert len(mock_session.get_calls) == 1
         args, kwargs = mock_session.get_calls[0]
-        assert (
-            args[0] == "https://example.com/api/v1.0/gear/?include_empty_location=true"
-        )
+        assert args[0] == "https://example.com/api/v1.0/gear/"
         assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
-        assert kwargs["params"] is None
+        assert kwargs["params"] == {"include_empty_location": "true"}
 
     @pytest.mark.asyncio
     async def test_get_er_gears_success_with_params(
@@ -222,11 +220,37 @@ class TestBuoyClient:
         # Verify the correct API call was made with params
         assert len(mock_session.get_calls) == 1
         args, kwargs = mock_session.get_calls[0]
-        assert (
-            args[0] == "https://example.com/api/v1.0/gear/?include_empty_location=true"
-        )
+        assert args[0] == "https://example.com/api/v1.0/gear/"
         assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
-        assert kwargs["params"] == params
+        assert kwargs["params"] == {**params, "include_empty_location": "true"}
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_forwards_state_filter(
+        self, mocker, sample_buoy_gear_data
+    ):
+        """The /gear/ endpoint defaults to state=deployed; hauled gears must
+        be requested explicitly. Verify the `state` kwarg is forwarded as a
+        query param so callers can opt into each lifecycle."""
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+
+        response_data = {"data": {"results": [sample_buoy_gear_data], "next": None}}
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value=response_data)
+
+        mock_session = MockSession(MockGetContext(mock_response))
+        mock_client_session = mocker.patch("aiohttp.ClientSession")
+        mock_client_session.return_value = MockSessionContext(mock_session)
+
+        await client.get_er_gears(params={"page_size": 100}, state="hauled")
+
+        assert len(mock_session.get_calls) == 1
+        _, kwargs = mock_session.get_calls[0]
+        assert kwargs["params"] == {
+            "page_size": 100,
+            "include_empty_location": "true",
+            "state": "hauled",
+        }
 
     @pytest.mark.asyncio
     async def test_get_er_gears_success_multiple_pages(
