@@ -266,19 +266,26 @@ class EdgeTechProcessor:
         # → dateDeployed - 1s (re-deployments without dateRecovered) → lastUpdated.
         #
         # For re-deployments, only consider changeRecord dateRecovered values that
-        # occurred *after* the current ER gear's deployment date. Older values
-        # belong to a previous deploy/haul lifecycle and would produce an
-        # incorrect (or duplicate) recorded_at.
+        # occurred *after* the most recent deployment among the ER gear's devices.
+        # Using max() (not min()) guarantees haul_recorded_at >= every device's
+        # last_deployed — Buoy API stores [last_deployed, recorded_at] as a
+        # tstzrange per device and rejects an inverted range. Devices in the
+        # same gearset can legitimately have different last_deployed values
+        # (e.g. end unit's own dateDeployed), so the earliest date is an unsafe
+        # floor: a recovery between the earliest and latest deploys passes
+        # min() but produces an inverted range for the later-deployed device.
         haul_recorded_at = self._utcnow()
-        change_record_min_date: Optional[datetime] = None
-        if is_redeployment:
-            er_deployment_dates = [
-                d.last_deployed
-                for d in er_gear.devices
-                if isinstance(getattr(d, "last_deployed", None), datetime)
-            ]
-            if er_deployment_dates:
-                change_record_min_date = min(er_deployment_dates)
+        er_deployment_dates = [
+            d.last_deployed
+            for d in er_gear.devices
+            if isinstance(getattr(d, "last_deployed", None), datetime)
+        ]
+        max_er_deployment_date: Optional[datetime] = (
+            max(er_deployment_dates) if er_deployment_dates else None
+        )
+        change_record_min_date: Optional[datetime] = (
+            max_er_deployment_date if is_redeployment else None
+        )
 
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
@@ -309,6 +316,30 @@ class EdgeTechProcessor:
                     )
                 elif edgetech_buoy.currentState.lastUpdated:
                     haul_recorded_at = edgetech_buoy.currentState.lastUpdated
+
+        # Safety clamp: Buoy API builds a per-device tstzrange
+        # [last_deployed, recorded_at] and rejects inverted ranges with
+        # "range lower bound must be less than or equal to range upper bound".
+        # If upstream data produced a haul_recorded_at older than any device's
+        # last_deployed (e.g. anomalous ER state where devices in the same
+        # gearset have disparate deployment dates), bump recorded_at to
+        # max(last_deployed) + 1s. The +1s avoids colliding with the original
+        # deploy event on the (device_id, recorded_at) uniqueness constraint
+        # after the millisecond-truncation step in the payload builder.
+        if (
+            max_er_deployment_date is not None
+            and haul_recorded_at <= max_er_deployment_date
+        ):
+            clamped = max_er_deployment_date + timedelta(seconds=1)
+            logger.warning(
+                "Haul recorded_at (%s) is not after max device last_deployed (%s) "
+                "for gear %s; clamping to %s to keep the deploy/haul range valid.",
+                haul_recorded_at,
+                max_er_deployment_date,
+                er_gear.display_id,
+                clamped,
+            )
+            haul_recorded_at = clamped
 
         if edgetech_buoy:
             if (

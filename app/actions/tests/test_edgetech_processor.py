@@ -2252,6 +2252,118 @@ class TestEdgeTechProcessor:
         assert haul_payload["devices"][0]["location"]["latitude"] == 41.749452004389454
         assert haul_payload["devices"][0]["location"]["longitude"] == -70.7414179924815
 
+    def test_redeployment_haul_recorded_at_is_after_latest_device_last_deployed(self):
+        """Regression: Buoy API stores [last_deployed, recorded_at] as a per-device
+        tstzrange and rejects inverted ranges with "range lower bound must be less
+        than or equal to range upper bound".  When an ER gear has devices with
+        disparate last_deployed values (e.g. primary re-deployed but secondary still
+        reflects an older deploy), a changeRecord dateRecovered that lies *between*
+        the two device last_deployed values must NOT be used — it would produce a
+        valid range for the older device but an inverted range for the newer one.
+
+        Real-world scenario that produced a 500 from Buoy API:
+          Device 1 (ER) last_deployed = Mar 25
+          Device 2 (ER) last_deployed = Feb 3
+          changeRecord dateRecovered    = Mar 19     (between the two)
+          → Mar 19 is < Mar 25 → inverted range for Device 1 → 500 Internal Server Error
+        """
+        user_id = "6228fab6b9923b00705ba333"
+        serial_number = "88CE99D99A"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "X",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 41.4558047,
+                "lonDeg": -71.2610299,
+                "modelNumber": "1234",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-21T14:45:09.000Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-21T14:45:09.000Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-19T21:27:54.000Z",
+                    "changes": [
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-03-19T21:27:54.000Z",
+                        },
+                        {"key": "isDeployed", "oldValue": True, "newValue": False},
+                    ],
+                }
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}"
+        device_1 = BuoyDevice(
+            device_id="142138ca-5e12-4148-aae7-0d7ca2b2e2aa",
+            mfr_device_id=device_id_a,
+            label="Device 1",
+            location=DeviceLocation(latitude=41.4558047, longitude=-71.2610299),
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 25, 4, 1, 6, tzinfo=timezone.utc),
+        )
+        device_2 = BuoyDevice(
+            device_id="a7aa9517-b1d3-4ec8-bbd1-9483f163c419",
+            mfr_device_id=device_id_a,
+            label="Device 2",
+            location=DeviceLocation(latitude=41.4558047, longitude=-71.2610299),
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 2, 3, 15, 47, 6, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="68da0e03-3fec-4057-b697-66b395c9c153",
+            status="deployed",
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            devices=[device_1, device_2],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        # The haul recorded_at must be strictly after every device's last_deployed;
+        # otherwise Buoy API's per-device tstzrange is inverted.
+        latest_last_deployed = max(device_1.last_deployed, device_2.last_deployed)
+        for haul_device in haul_payload["devices"]:
+            recorded_at = datetime.fromisoformat(haul_device["recorded_at"])
+            last_deployed = datetime.fromisoformat(haul_device["last_deployed"])
+            assert recorded_at >= last_deployed, (
+                f"Inverted range for device {haul_device['mfr_device_id']}: "
+                f"last_deployed={last_deployed} > recorded_at={recorded_at}"
+            )
+            assert recorded_at > latest_last_deployed, (
+                f"recorded_at ({recorded_at}) must be strictly after the latest "
+                f"device last_deployed ({latest_last_deployed}) to avoid both the "
+                f"inverted-range error and the (device_id, recorded_at) unique "
+                f"constraint collision with the deploy event"
+            )
+
+        # The stale Mar 19 dateRecovered must NOT have been used
+        stale_mar_19 = "2026-03-19T21:27:54+00:00"
+        for haul_device in haul_payload["devices"]:
+            assert haul_device["recorded_at"] != stale_mar_19, (
+                f"Must not use stale dateRecovered ({stale_mar_19}) that is before "
+                f"the most recent device last_deployed"
+            )
+
     @pytest.mark.asyncio
     async def test_process_prefers_deployed_gear_over_hauled_for_same_device(self):
         """When ER returns multiple gears sharing a mfr_device_id (e.g. a hauled
