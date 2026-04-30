@@ -226,11 +226,44 @@ The `currentState` contains all current information about a buoy:
 2. **End Location**: `endLatDeg` / `endLonDeg` (for two-unit systems)
 3. **Recovery Location**: `recoveredLatDeg` / `recoveredLonDeg` (when retrieved)
 
+### Deployment Shapes
+
+EdgeTech data resolves into one of three gearset shapes. Which one applies is a property of the EdgeTech record itself; the processor branches on it when building the gear payload.
+
+| Shape | EdgeTech serials | ER devices | `deployment_type` | Distinguishing field |
+|---|---|---|---|---|
+| **Single-device** | 1 | 1 (no suffix) | `single` | only `latDeg` / `lonDeg`; no `endLatDeg` / `endLonDeg`; not `isTwoUnitLine` |
+| **Single-unit trawl** | 1 | 2 (`_A` start, `_B` end) | `trawl` | `endLatDeg` / `endLonDeg` set on the same record |
+| **Two-unit line** | 2 (paired start + end records) | 2 (each unit's own serial, no suffix) | `trawl` | `isTwoUnitLine: true` plus the `startUnit` / `endUnit` cross-reference |
+
+**Single-device deployment**: the simplest case — one buoy with one tracked location. Example:
+```json
+{
+  "serialNumber": "88CE99E9C7",
+  "currentState": {
+    "latDeg": 41.63586767394248,
+    "lonDeg": -70.91513821861791,
+    "isDeployed": true,
+    "isTwoUnitLine": null
+  }
+}
+```
+ER receives one device with `mfr_device_id = "88CE99E9C7_{hashedUserId}"` and `deployment_type: "single"`.
+
+**Single-unit trawl**: one EdgeTech buoy that records two endpoints of a trap line on the same record. The `_A` device uses `latDeg` / `lonDeg`; the `_B` device uses `endLatDeg` / `endLonDeg`. Both share the gearset.
+
+**Two-unit line**: two physical buoys, one record each, joined via `startUnit` / `endUnit` — see the next section.
+
 ### Two-Unit Line Systems
 
-EdgeTech supports buoy systems with two physical units connected by a line:
+EdgeTech represents a two-unit gearset (`isTwoUnitLine: true`) as **two separate serialNumber records**, one per physical device. Each record carries the location of its own device. The two records reference each other through `startUnit` / `endUnit`:
 
-**Start Unit Record**
+- The **start unit's** record carries `endUnit: <other-serial>` and `startUnit: null` — it points outward to the end.
+- The **end unit's** record carries `startUnit: <other-serial>` and `endUnit: null` — it points back to the start.
+
+**The startUnit serialNumber is the canonical gearset identifier.** Equivalently: the record that has `endUnit` set (and `startUnit: null`) IS the start unit, and its own `serialNumber` is the gearset id. The end-unit record exists only to supply the end-unit location for that same gearset.
+
+**Start Unit Record** (canonical — its `serialNumber` identifies the gearset)
 ```json
 {
   "serialNumber": "ET-12345",
@@ -244,7 +277,7 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 }
 ```
 
-**End Unit Record**
+**End Unit Record** (supplies end-unit location only)
 ```json
 {
   "serialNumber": "ET-12346",
@@ -258,11 +291,15 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 }
 ```
 
+**Change-record behavior**: On deploy, both records flip `isDeployed: true`, populate `isTwoUnitLine: true`, and set their respective `startUnit` / `endUnit` pointers. On haul, both records null out `startUnit` / `endUnit`, `isTwoUnitLine`, `dateDeployed`, `latDeg`, and `lonDeg`, flip `isDeployed: false`, and set `dateRecovered` plus `recoveredLatDeg` / `recoveredLonDeg`. Both records share the **same** `dateRecovered` timestamp and recovered coordinates (it's a single physical recovery point); `lastUpdated` may differ by a few milliseconds between the two records.
+
+**Hauled-state caveat**: After a haul, `currentState` on either record no longer carries the pair-linkage — `startUnit`, `endUnit`, and `isTwoUnitLine` are all null. A hauled end-unit record is therefore indistinguishable from a hauled start-unit record by `currentState` alone. To recover the pair-linkage for a hauled record, inspect the most recent `MODIFY` `changeRecord` and read the `oldValue` of `startUnit` / `endUnit` / `isTwoUnitLine`. In practice, hauls are matched to ER gears via `mfr_device_id`, so the pair grouping comes from the existing ER gear set rather than from the post-haul EdgeTech state.
+
 **Processing Logic**
 - Both units share the same `userId`
-- The start unit (`startUnit: null`) initiates processing
-- The end unit (`endUnit: null`) is skipped (processed as part of start unit)
-- If end unit is missing, the start unit is skipped with a warning
+- The start unit record (`startUnit: null`, `endUnit` set) initiates processing — its serial is the gearset id
+- The end unit record (`endUnit: null`, `startUnit` set) is skipped; it is consumed as the end-location source for the start unit's gearset
+- If the end unit record is missing from the dump, the start unit is skipped with a warning
 - **Circular two-unit protection**: If the same two devices are each configured as start with the other as end (e.g. A.endUnit=B and B.endUnit=A), only one gearset is created. The duplicate start is skipped (canonical lead is the device with the smaller serial number), and a warning is logged.
 
 ---
@@ -570,14 +607,17 @@ def get_hashed_user_id(user_id: str) -> str:
 
 #### Single-Unit Buoys
 
-For standard buoys (not two-unit lines), we create **two devices** representing start and end of the trap line:
+A single-unit record (one EdgeTech serial, `isTwoUnitLine` false/null) produces either one or two ER devices, depending on whether end coordinates are present.
 
+**Single-unit trawl** (`endLatDeg` / `endLonDeg` present): two devices, one gearset, `deployment_type: "trawl"`:
 ```
-Device A: {serialNumber}_{hashedUserId}_A
-Device B: {serialNumber}_{hashedUserId}_B
+Device A: {serialNumber}_{hashedUserId}_A   (start, uses latDeg/lonDeg)
+Device B: {serialNumber}_{hashedUserId}_B   (end,   uses endLatDeg/endLonDeg)
 ```
 
-**Example**:
+**Single-device deployment** (`endLatDeg` / `endLonDeg` absent): one device, `deployment_type: "single"`. No `_A`/`_B` suffix — the lone device's `mfr_device_id` is just `{serialNumber}_{hashedUserId}`.
+
+**Example** (single-unit trawl):
 ```
 EdgeTech Data:
   serialNumber: "8899CEDAAA"
@@ -592,8 +632,7 @@ Device B: 8899CEDAAA_a1b2c3d4_B (end point - uses endLatDeg/endLonDeg)
 **Gear Payload Notes**:
 - Both devices share the same `set_id`
 - Device A uses `latDeg` / `lonDeg`
-- Device B uses `endLatDeg` / `endLonDeg` (if present)
-- If end coordinates missing, only Device A is created (deployment_type="single")
+- Device B uses `endLatDeg` / `endLonDeg`
 
 #### Two-Unit Line Buoys
 

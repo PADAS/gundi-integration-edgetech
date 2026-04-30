@@ -890,6 +890,383 @@ class TestEdgeTechProcessor:
         assert "not in sync window; using current state from ER" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_process_update_single_unit_trawl_end_only_location_change(
+        self, mocker, caplog
+    ):
+        """Single-unit-trawl Device B moves while Device A holds: must produce an update."""
+        user_id = "634431265e87a0a75163a20b"
+        hashed = get_hashed_user_id(user_id)
+        serial = "8899CEDAAA"
+
+        # Device A unchanged, Device B (endLat/endLon) moved.
+        record = {
+            "serialNumber": serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"abc"',
+                "isDeleted": False,
+                "serialNumber": serial,
+                "releaseCommand": "C8AB8C75AA",
+                "statusCommand": serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-02-15T14:56:47.660Z",
+                "lastUpdated": "2026-02-15T15:01:58.663Z",
+                "latDeg": 44.358265,  # unchanged
+                "lonDeg": -68.16757,  # unchanged
+                "endLatDeg": 44.999999,  # NEW
+                "endLonDeg": -68.999999,  # NEW
+                "isTwoUnitLine": None,
+                "endUnit": None,
+                "startUnit": None,
+            },
+            "changeRecords": [],
+        }
+        processor = EdgeTechProcessor(data=[record], er_token="t", er_url="u")
+
+        a_id = f"{serial}_{hashed}_A"
+        b_id = f"{serial}_{hashed}_B"
+        ts = datetime(2026, 2, 15, 14, 56, 48, tzinfo=timezone.utc)
+        device_a = BuoyDevice(
+            device_id=a_id,
+            mfr_device_id=a_id,
+            label="A",
+            location=DeviceLocation(latitude=44.358265, longitude=-68.16757),
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        device_b = BuoyDevice(
+            device_id=b_id,
+            mfr_device_id=b_id,
+            label="B",
+            location=DeviceLocation(latitude=44.000000, longitude=-68.000000),  # OLD
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-AB",
+            status="deployed",
+            last_updated=ts,
+            devices=[device_a, device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        mock_client = mocker.MagicMock()
+        mock_client.get_er_gears = AsyncMock(return_value=[gear])
+        processor._er_client = mock_client
+
+        with caplog.at_level(logging.INFO):
+            payloads = await processor.process()
+
+        assert len(payloads) == 1
+        devices_by_mfr = {d["mfr_device_id"]: d for d in payloads[0]["devices"]}
+        assert devices_by_mfr[b_id]["location"]["latitude"] == 44.999999
+        assert devices_by_mfr[b_id]["location"]["longitude"] == -68.999999
+        assert devices_by_mfr[a_id]["location"]["latitude"] == 44.358265
+        assert "skipping update" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_process_update_two_unit_end_record_only_location_change(
+        self, mocker, caplog
+    ):
+        """Two-unit gearset where only the end record moves: redirect must drive the
+        start record's iteration to emit an update with the end's new location."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "88CE99B71C"
+        end_serial = "88CE99CAE8"
+        early = "2026-02-15T14:56:47.660Z"
+        late = "2026-02-15T15:30:00.000Z"
+
+        start_record = {
+            "serialNumber": start_serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"start"',
+                "isDeleted": False,
+                "serialNumber": start_serial,
+                "releaseCommand": "C8AB8CEA9C",
+                "statusCommand": start_serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": early,
+                "isTwoUnitLine": True,
+                "endUnit": end_serial,
+                "startUnit": None,
+                "lastUpdated": early,  # NOT bumped
+                "latDeg": 40.357,  # unchanged
+                "lonDeg": -70.963,  # unchanged
+            },
+            "changeRecords": [],
+        }
+        end_record = {
+            "serialNumber": end_serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"end"',
+                "isDeleted": False,
+                "serialNumber": end_serial,
+                "releaseCommand": "C8AB8CEA9D",
+                "statusCommand": end_serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": early,
+                "isTwoUnitLine": True,
+                "endUnit": None,
+                "startUnit": start_serial,
+                "lastUpdated": late,  # bumped
+                "latDeg": 40.999,  # NEW
+                "lonDeg": -70.111,  # NEW
+            },
+            "changeRecords": [],
+        }
+        processor = EdgeTechProcessor(
+            data=[start_record, end_record], er_token="t", er_url="u"
+        )
+
+        start_id = f"{start_serial}_{hashed}"
+        end_id = f"{end_serial}_{hashed}"
+        ts = datetime(2026, 2, 15, 14, 56, 48, tzinfo=timezone.utc)
+        start_device = BuoyDevice(
+            device_id=start_id,
+            mfr_device_id=start_id,
+            label="start",
+            location=DeviceLocation(latitude=40.357, longitude=-70.963),
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        end_device = BuoyDevice(
+            device_id=end_id,
+            mfr_device_id=end_id,
+            label="end",
+            location=DeviceLocation(latitude=40.358, longitude=-70.959),  # OLD
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-2U",
+            status="deployed",
+            last_updated=ts,
+            devices=[start_device, end_device],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        mock_client = mocker.MagicMock()
+        mock_client.get_er_gears = AsyncMock(return_value=[gear])
+        processor._er_client = mock_client
+
+        with caplog.at_level(logging.INFO):
+            payloads = await processor.process()
+
+        assert len(payloads) == 1
+        devices_by_mfr = {d["mfr_device_id"]: d for d in payloads[0]["devices"]}
+        assert devices_by_mfr[end_id]["location"]["latitude"] == 40.999
+        assert devices_by_mfr[end_id]["location"]["longitude"] == -70.111
+        assert devices_by_mfr[start_id]["location"]["latitude"] == 40.357
+        assert "target_key=" + f"{start_serial}/{hashed}" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_end_record_update_redirected_to_start_key(
+        self, mocker, a_new_edgetech_trawl_record
+    ):
+        """Direct check: an end-record update lands under the start record's key."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "STARTSERIAL"
+        end_serial = "ENDSERIAL"
+        early = datetime(2026, 2, 15, 14, 56, 47, tzinfo=timezone.utc)
+        late = datetime(2026, 2, 15, 15, 30, 0, tzinfo=timezone.utc)
+
+        start_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": start_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"s"',
+                    "isDeleted": False,
+                    "serialNumber": start_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": start_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": end_serial,
+                    "startUnit": None,
+                    "lastUpdated": early.isoformat(),
+                    "latDeg": 1.0,
+                    "lonDeg": 2.0,
+                },
+                "changeRecords": [],
+            }
+        )
+        end_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": end_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"e"',
+                    "isDeleted": False,
+                    "serialNumber": end_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": end_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": None,
+                    "startUnit": start_serial,
+                    "lastUpdated": late.isoformat(),
+                    "latDeg": 9.0,  # moved
+                    "lonDeg": 8.0,
+                },
+                "changeRecords": [],
+            }
+        )
+
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="G",
+            status="deployed",
+            last_updated=early,
+            devices=[
+                BuoyDevice(
+                    device_id=f"{start_serial}_{hashed}",
+                    mfr_device_id=f"{start_serial}_{hashed}",
+                    label="s",
+                    location=DeviceLocation(latitude=1.0, longitude=2.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+                BuoyDevice(
+                    device_id=f"{end_serial}_{hashed}",
+                    mfr_device_id=f"{end_serial}_{hashed}",
+                    label="e",
+                    location=DeviceLocation(latitude=3.0, longitude=4.0),  # OLD
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+            ],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        er_map = {
+            f"{start_serial}_{hashed}": gear,
+            f"{end_serial}_{hashed}": gear,
+        }
+        sn_map = {
+            f"{start_serial}/{hashed}": start_buoy,
+            f"{end_serial}/{hashed}": end_buoy,
+        }
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="t", er_url="u"
+        )
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(er_map, sn_map)
+
+        # The end-record update is redirected to the start key. The end key must
+        # NOT be in to_update (it would be skipped by is_end_unit_record otherwise).
+        assert f"{start_serial}/{hashed}" in to_update
+        assert f"{end_serial}/{hashed}" not in to_update
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_end_record_update_with_start_outside_sync_window(
+        self, mocker, caplog, a_new_edgetech_trawl_record
+    ):
+        """If the end record needs an update but the start record isn't in the sync
+        window, we can't drive the update from the start — log a warning and skip."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "STARTSERIAL"
+        end_serial = "ENDSERIAL"
+        early = datetime(2026, 2, 15, 14, 56, 47, tzinfo=timezone.utc)
+        late = datetime(2026, 2, 15, 15, 30, 0, tzinfo=timezone.utc)
+
+        end_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": end_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"e"',
+                    "isDeleted": False,
+                    "serialNumber": end_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": end_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": None,
+                    "startUnit": start_serial,
+                    "lastUpdated": late.isoformat(),
+                    "latDeg": 9.0,
+                    "lonDeg": 8.0,
+                },
+                "changeRecords": [],
+            }
+        )
+
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="G",
+            status="deployed",
+            last_updated=early,
+            devices=[
+                BuoyDevice(
+                    device_id=f"{start_serial}_{hashed}",
+                    mfr_device_id=f"{start_serial}_{hashed}",
+                    label="s",
+                    location=DeviceLocation(latitude=1.0, longitude=2.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+                BuoyDevice(
+                    device_id=f"{end_serial}_{hashed}",
+                    mfr_device_id=f"{end_serial}_{hashed}",
+                    label="e",
+                    location=DeviceLocation(latitude=3.0, longitude=4.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+            ],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        er_map = {
+            f"{start_serial}_{hashed}": gear,
+            f"{end_serial}_{hashed}": gear,
+        }
+        # Only the end record is in the sync window — start is missing.
+        sn_map = {f"{end_serial}/{hashed}": end_buoy}
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="t", er_url="u"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            to_deploy, to_haul, to_update = await processor._identify_buoys(
+                er_map, sn_map
+            )
+
+        assert to_update == set()
+        assert "is not in the sync window" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_process_update_validation_error(
         self, mocker, caplog, a_new_edgetech_trawl_record
     ):

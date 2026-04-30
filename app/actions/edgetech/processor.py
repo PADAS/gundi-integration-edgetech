@@ -113,16 +113,9 @@ class EdgeTechProcessor:
         main_device_id = f"{buoy.serialNumber}_{hashed_user_id}"
 
         secondary_device_id = None
-        if buoy.currentState.endLatDeg and buoy.currentState.endLonDeg:
-            main_device_id += "_A"
-            secondary_device_id = f"{buoy.serialNumber}_{hashed_user_id}_B"
-            secondary_latitude = buoy.currentState.endLatDeg
-            secondary_longitude = buoy.currentState.endLonDeg
-            secondary_last_deployed = last_deployed
-            secondary_recorded_at = deployment_recorded_at
-            secondary_device_additional_data = json.loads(buoy.json())
-            secondary_device_additional_data.pop("changeRecords", None)
-        elif end_unit_buoy:
+        # Two-unit gearset branches lead so they win even if a two-unit start
+        # record ever populates endLatDeg/endLonDeg (which today it does not).
+        if end_unit_buoy:
             secondary_device_id = f"{end_unit_buoy.serialNumber}_{hashed_user_id}"
             secondary_latitude = end_unit_buoy.currentState.latDeg
             secondary_longitude = end_unit_buoy.currentState.lonDeg
@@ -164,6 +157,17 @@ class EdgeTechProcessor:
                     else None
                 ),
             }
+        elif buoy.currentState.endLatDeg and buoy.currentState.endLonDeg:
+            # Single-unit buoy with start+end coordinates: emit two devices
+            # under one gearset (suffixed _A / _B).
+            main_device_id += "_A"
+            secondary_device_id = f"{buoy.serialNumber}_{hashed_user_id}_B"
+            secondary_latitude = buoy.currentState.endLatDeg
+            secondary_longitude = buoy.currentState.endLonDeg
+            secondary_last_deployed = last_deployed
+            secondary_recorded_at = deployment_recorded_at
+            secondary_device_additional_data = json.loads(buoy.json())
+            secondary_device_additional_data.pop("changeRecords", None)
 
         main_device = {
             "device_id": manufacturer_id_to_source_id.get(main_device_id)
@@ -406,6 +410,73 @@ class EdgeTechProcessor:
 
         return payload
 
+    @staticmethod
+    def _expected_device_locations(
+        buoy: Buoy,
+        end_unit_buoy: Optional[Buoy],
+        end_unit_device_from_er: Optional[BuoyDevice],
+        hashed_user_id: str,
+    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        # Map every ER mfr_device_id we expect to publish for this gearset to
+        # its intended (lat, lon) from the current EdgeTech state. The update
+        # loop diffs this against the live ER gear to decide whether anything
+        # actually moved — covers single-device, single-unit-trawl (A/B), and
+        # two-unit (paired records) shapes uniformly.
+        expected: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        primary_id = f"{buoy.serialNumber}_{hashed_user_id}"
+        primary_loc = (buoy.currentState.latDeg, buoy.currentState.lonDeg)
+
+        if end_unit_buoy is not None:
+            expected[primary_id] = primary_loc
+            expected[f"{end_unit_buoy.serialNumber}_{hashed_user_id}"] = (
+                end_unit_buoy.currentState.latDeg,
+                end_unit_buoy.currentState.lonDeg,
+            )
+        elif end_unit_device_from_er is not None:
+            # End record absent from sync window; only the start side carries
+            # new data so we only diff the primary device.
+            expected[primary_id] = primary_loc
+        elif (
+            buoy.currentState.endLatDeg is not None
+            and buoy.currentState.endLonDeg is not None
+        ):
+            expected[f"{primary_id}_A"] = primary_loc
+            expected[f"{primary_id}_B"] = (
+                buoy.currentState.endLatDeg,
+                buoy.currentState.endLonDeg,
+            )
+        else:
+            expected[primary_id] = primary_loc
+
+        return expected
+
+    @staticmethod
+    def _gearset_location_changed(
+        er_gear: BuoyGear,
+        expected_locations: Dict[str, Tuple[Optional[float], Optional[float]]],
+    ) -> bool:
+        # Match each ER device to an expected entry by mfr_device_id, tolerating
+        # `_A`/`_B` suffix mismatches: a gearset previously deployed as
+        # single-unit-trawl (devices stored with `_A`/`_B`) may now be reporting
+        # as two-unit (no suffix) and vice versa. The serial-prefix is the
+        # stable identifier across shape transitions.
+        for er_device in er_gear.devices:
+            mfr_id = er_device.mfr_device_id
+            expected = expected_locations.get(mfr_id)
+            if expected is None and (mfr_id.endswith("_A") or mfr_id.endswith("_B")):
+                expected = expected_locations.get(mfr_id[:-2])
+            if expected is None:
+                stripped_candidates = (f"{mfr_id}_A", f"{mfr_id}_B")
+                for candidate in stripped_candidates:
+                    if candidate in expected_locations:
+                        expected = expected_locations[candidate]
+                        break
+            if expected is None:
+                continue
+            if (er_device.location.latitude, er_device.location.longitude) != expected:
+                return True
+        return False
+
     def _is_hauled_or_recovered(self, record: Buoy) -> bool:
         """
         Determine if a buoy record indicates a hauled/recovered state.
@@ -606,7 +677,7 @@ class EdgeTechProcessor:
         latest: Dict[str, Buoy] = {}
 
         for record in data:
-            key = f"{record.serialNumber}{record.userId}"
+            key = f"{record.serialNumber}/{record.userId}"
             prev = latest.get(key)
             if (
                 prev is None
@@ -772,10 +843,29 @@ class EdgeTechProcessor:
                     # collide after _remove_milliseconds truncation.
 
                     if location_changed or has_newer_data:
-                        to_update.add(serial_number_user_id)
+                        target_key = serial_number_user_id
+                        if edgetech_buoy.is_end_unit_record:
+                            # End-unit record can't drive an update on its own
+                            # (the update loop skips end-unit iterations), so
+                            # redirect to its start record's key. The start's
+                            # iteration diffs both devices' locations against ER
+                            # and emits the gearset update if either moved.
+                            candidate_start_key = f"{edgetech_buoy.currentState.startUnit}/{hashed_user_id}"
+                            if candidate_start_key in serial_number_to_edgetech_buoy:
+                                target_key = candidate_start_key
+                            else:
+                                logger.warning(
+                                    "End-unit record %s flagged for update but its start "
+                                    "record %s is not in the sync window; update skipped.",
+                                    serial_number_user_id,
+                                    candidate_start_key,
+                                )
+                                continue
+                        to_update.add(target_key)
                         logger.info(
                             f"Buoy {serial_number_user_id} marked for update "
-                            f"(location_changed={location_changed}, has_newer_data={has_newer_data})"
+                            f"(location_changed={location_changed}, has_newer_data={has_newer_data}; "
+                            f"target_key={target_key})"
                         )
 
         logger.info(f"Buoys to deploy: {len(to_deploy)} - {to_deploy}")
@@ -1004,6 +1094,11 @@ class EdgeTechProcessor:
         for serial_number_user_id in to_deploy:
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
 
+            if edgetech_buoy.is_end_unit_record:
+                # Partner record of a two-unit gearset; the start unit's iteration
+                # builds the full payload using this record's location.
+                continue
+
             try:
                 # Get end unit buoy if this is a two-unit line
                 end_unit_buoy = None
@@ -1051,10 +1146,6 @@ class EdgeTechProcessor:
                             )
                             continue
 
-                if edgetech_buoy.currentState.startUnit:
-                    # This record is for the end unit, skip it (will be handled by start unit)
-                    continue
-
                 if serial_number_user_id in circular_two_unit_skip_keys:
                     logger.warning(
                         "Skipping deployment for %s (circular two-unit duplicate).",
@@ -1085,8 +1176,11 @@ class EdgeTechProcessor:
         # Process updates (existing gear sets with location changes)
         for serial_number_user_id in to_update:
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
-            edgetech_buoy_lat = edgetech_buoy.currentState.latDeg
-            edgetech_buoy_long = edgetech_buoy.currentState.lonDeg
+
+            if edgetech_buoy.is_end_unit_record:
+                # Partner record of a two-unit gearset; the start unit's iteration
+                # builds the full update payload.
+                continue
 
             primary_device_name = f"{serial_number_user_id.replace('/', '_')}_A"
             single_device_name = f"{serial_number_user_id.replace('/', '_')}"
@@ -1100,36 +1194,15 @@ class EdgeTechProcessor:
                 )
                 continue
 
-            # Find device location in ER gear
-            er_device_lat = None
-            er_device_long = None
-            for er_device in er_gear.devices:
-                if (
-                    er_device.mfr_device_id == primary_device_name
-                    or er_device.mfr_device_id == single_device_name
-                ):
-                    er_device_lat = er_device.location.latitude
-                    er_device_long = er_device.location.longitude
-                    break
-
-            if (
-                er_device_lat == edgetech_buoy_lat
-                and er_device_long == edgetech_buoy_long
-            ):
-                # No change in location, skip update
-                logger.info(
-                    "No change in location for buoy %s, skipping update.",
-                    serial_number_user_id,
-                )
-                continue
-
             try:
-                # Get end unit buoy if this is a two-unit line
+                hashed_user_id = get_hashed_user_id(edgetech_buoy.userId)
                 end_unit_buoy = None
                 end_unit_device_from_er = None
                 if edgetech_buoy.currentState.isTwoUnitLine:
                     if edgetech_buoy.currentState.endUnit:
-                        end_unit_buoy_key = f"{edgetech_buoy.currentState.endUnit}/{get_hashed_user_id(edgetech_buoy.userId)}"
+                        end_unit_buoy_key = (
+                            f"{edgetech_buoy.currentState.endUnit}/{hashed_user_id}"
+                        )
                         end_unit_buoy = serial_number_to_edgetech_buoy.get(
                             end_unit_buoy_key
                         )
@@ -1138,7 +1211,9 @@ class EdgeTechProcessor:
                             # End unit not in sync window (e.g. only start unit had location update).
                             # Use end unit's current state from ER so we can still push the update.
                             # Match by mfr_device_id: same format as when we create the payload.
-                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
+                            end_unit_mfr_id = (
+                                f"{edgetech_buoy.currentState.endUnit}_{hashed_user_id}"
+                            )
                             for er_device in er_gear.devices:
                                 if er_device.mfr_device_id == end_unit_mfr_id:
                                     end_unit_device_from_er = er_device
@@ -1156,9 +1231,21 @@ class EdgeTechProcessor:
                                 serial_number_user_id,
                             )
 
-                    if edgetech_buoy.currentState.startUnit:
-                        # This record is for the end unit, skip it
-                        continue
+                # Diff every device in the gearset, not just the primary —
+                # single-unit-trawl Device B (endLatDeg/endLonDeg) and
+                # two-unit end records can move while the start holds.
+                expected_locations = self._expected_device_locations(
+                    edgetech_buoy,
+                    end_unit_buoy,
+                    end_unit_device_from_er,
+                    hashed_user_id,
+                )
+                if not self._gearset_location_changed(er_gear, expected_locations):
+                    logger.info(
+                        "No change in location for buoy %s (no device moved), skipping update.",
+                        serial_number_user_id,
+                    )
+                    continue
 
                 if serial_number_user_id in circular_two_unit_skip_keys:
                     logger.warning(

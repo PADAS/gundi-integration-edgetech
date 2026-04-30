@@ -1,11 +1,8 @@
 import logging
-import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import pydantic
-
-from app.actions.utils import get_hashed_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -98,3 +95,14 @@ class Buoy(pydantic.BaseModel):
         return (
             has_retrieved_location or has_deployed_location or has_deployed_end_location
         )
+
+    @property
+    def is_end_unit_record(self) -> bool:
+        # A two-unit gearset is sent as two records: the start record carries
+        # endUnit (pointing at the end's serial), the end record carries startUnit
+        # (pointing back at the start's serial). The start record is the canonical
+        # gearset; its serialNumber is the gearset id. End-unit records exist only
+        # to supply the end-unit location and should not produce their own gearset.
+        # Note: only meaningful while deployed — after a haul, EdgeTech nulls out
+        # both startUnit and endUnit, so this returns False for hauled records.
+        return bool(self.currentState.startUnit)
