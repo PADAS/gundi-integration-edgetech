@@ -64,6 +64,33 @@ class EdgeTechProcessor:
         """
         return dt.replace(microsecond=0)
 
+    @staticmethod
+    def _lookup_er_gear_preferring_deployed(
+        er_gears_devices_id_to_gear: Dict[str, BuoyGear],
+        *keys: str,
+    ) -> Optional[BuoyGear]:
+        """
+        Look up an ER gear by trying each `mfr_device_id` key in order, but
+        prefer a `status == "deployed"` match over a hauled one.
+
+        EdgeTech has no primary key for a buoy lifecycle — the same
+        serial+userId is reused across deployments, and the device-id suffix
+        format depends on the deploy mode at the time (no suffix for two-unit
+        lines, `_A`/`_B` for single-unit-with-end-coords). ER can therefore
+        hold a stale hauled gear AND a current deployed gear for the same
+        physical buoy under different keys, and the dedup at
+        `er_gears_devices_id_to_gear` (which keys on `mfr_device_id`) cannot
+        collapse them. Falling back to the first non-empty hit when no
+        deployed match exists preserves the recovery-deploy path where ER
+        is hauled but EdgeTech is now deployed.
+        """
+        candidates = [er_gears_devices_id_to_gear.get(k) for k in keys]
+        candidates = [g for g in candidates if g is not None]
+        return next(
+            (g for g in candidates if g.status == "deployed"),
+            candidates[0] if candidates else None,
+        )
+
     async def _create_gear_payload(
         self,
         buoy: Buoy,
@@ -729,25 +756,11 @@ class EdgeTechProcessor:
 
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
 
-            # Check if gear exists in ER. EdgeTech has no primary key, so the
-            # same serial+userId can be reused across deployment lifecycles —
-            # ER may hold a previously-hauled gear AND a current deployed gear
-            # for the same physical buoy under different mfr_device_id formats
-            # (e.g. `_A` from a single-unit-with-end-coords deploy, no suffix
-            # from a two-unit deploy). The dedup at `er_gears_devices_id_to_gear`
-            # only collapses entries sharing a key, so we must prefer the
-            # deployed match across all three name patterns; otherwise the
-            # first-found match (e.g. a stale hauled `_A` gear) hides the
-            # current deployment and produces a false "already hauled" skip.
-            candidate_gears = [
-                er_gears_devices_id_to_gear.get(primary_subject_name),
-                er_gears_devices_id_to_gear.get(standard_subject_name),
-                er_gears_devices_id_to_gear.get(secondary_subject_name),
-            ]
-            candidate_gears = [g for g in candidate_gears if g is not None]
-            er_gear = next(
-                (g for g in candidate_gears if g.status == "deployed"),
-                candidate_gears[0] if candidate_gears else None,
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_subject_name,
+                standard_subject_name,
+                secondary_subject_name,
             )
 
             if er_gear is None:
@@ -1062,9 +1075,11 @@ class EdgeTechProcessor:
             edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
 
             # Find the corresponding ER gear
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_device_name,
+                single_device_name,
+            )
 
             if not er_gear:
                 logger.warning(
@@ -1134,10 +1149,10 @@ class EdgeTechProcessor:
                             f"{edgetech_buoy.currentState.endUnit}"
                             f"_{get_hashed_user_id(edgetech_buoy.userId)}"
                         )
-                        er_gear = er_gears_devices_id_to_gear.get(
-                            f"{serial_number_user_id.replace('/', '_')}_A"
-                        ) or er_gears_devices_id_to_gear.get(
-                            serial_number_user_id.replace("/", "_")
+                        er_gear = self._lookup_er_gear_preferring_deployed(
+                            er_gears_devices_id_to_gear,
+                            f"{serial_number_user_id.replace('/', '_')}_A",
+                            serial_number_user_id.replace("/", "_"),
                         )
                         if er_gear:
                             for er_device in er_gear.devices:
@@ -1198,9 +1213,11 @@ class EdgeTechProcessor:
 
             primary_device_name = f"{serial_number_user_id.replace('/', '_')}_A"
             single_device_name = f"{serial_number_user_id.replace('/', '_')}"
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_device_name,
+                single_device_name,
+            )
 
             if not er_gear:
                 logger.warning(

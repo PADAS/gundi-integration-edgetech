@@ -148,6 +148,49 @@ class TestEdgeTechProcessor:
         assert "start_datetime" in filters
         assert isinstance(filters["start_datetime"], datetime)
 
+    def test_lookup_er_gear_preferring_deployed(self):
+        """
+        The helper underpins every ER-gear lookup that needs to disambiguate
+        deployment lifecycles for the same serial+userId. It must prefer a
+        `status == "deployed"` match across the given keys, fall back to the
+        first non-empty hit otherwise, and return None when no key matches.
+        """
+
+        def gear(status: str) -> BuoyGear:
+            return BuoyGear(
+                id=uuid4(),
+                display_id=f"GEAR-{status}",
+                status=status,
+                last_updated=datetime.now(timezone.utc),
+                devices=[],
+                type="ropeless",
+                manufacturer="edgetech",
+            )
+
+        hauled = gear("hauled")
+        deployed = gear("deployed")
+
+        # Deployed under a later key beats hauled under an earlier key.
+        m = {"k_A": hauled, "k": deployed}
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed(m, "k_A", "k", "k_B")
+            is deployed
+        )
+
+        # Only hauled present — fallback to first non-empty hit (preserves
+        # the recovery-deploy path: ER hauled but EdgeTech now deployed).
+        m = {"k_A": hauled}
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed(m, "k_A", "k", "k_B")
+            is hauled
+        )
+
+        # No matches.
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed({}, "k_A", "k")
+            is None
+        )
+
     def test_should_skip_buoy_deleted(self, deleted_buoy_record):
         """Test that deleted buoys are NOT skipped (needed for haul detection)."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
@@ -834,6 +877,109 @@ class TestEdgeTechProcessor:
 
         # Verify that the ER client was called
         assert mock_er_client.get_er_gears.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_process_haul_targets_deployed_gear_not_stale_hauled(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        Regression for the lifecycle-collision bug: when ER holds both a stale
+        hauled gear (e.g. from a single-unit-with-end-coords deploy with `_A`/
+        `_B` devices) and a current deployed gear (e.g. a two-unit redeploy
+        with no-suffix devices) for the same physical buoy, and EdgeTech now
+        reports the buoy as recovered, the haul payload must target the
+        current deployed gear's set_id and devices — not the stale hauled
+        one's, which would already have status="hauled" in ER and produce
+        a 400 "Device ... is already hauled" response.
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+
+        # Stale hauled gear from a prior single-unit-with-end-coords lifecycle
+        # — devices keyed `_A` and `_B`.
+        stale_id = uuid4()
+        stale_hauled_gear = BuoyGear(
+            id=stale_id,
+            display_id=str(stale_id),
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[
+                BuoyDevice(
+                    device_id="stale-uuid-a",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}_A",
+                    label="Stale A",
+                    location=DeviceLocation(latitude=40.0, longitude=-70.0),
+                    last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+                ),
+                BuoyDevice(
+                    device_id="stale-uuid-b",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}_B",
+                    label="Stale B",
+                    location=DeviceLocation(latitude=40.1, longitude=-70.1),
+                    last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+                ),
+            ],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        # Current deployed gear from a later single-unit lifecycle —
+        # device keyed without suffix.
+        current_id = uuid4()
+        current_deployed_gear = BuoyGear(
+            id=current_id,
+            display_id=str(current_id),
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[
+                BuoyDevice(
+                    device_id="current-uuid",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}",
+                    label="Current",
+                    location=DeviceLocation(latitude=40.7128, longitude=-74.0060),
+                    last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+                ),
+            ],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        async def fake_get_er_gears(params=None, state=None):
+            if state == "deployed":
+                return [current_deployed_gear]
+            if state == "hauled":
+                return [stale_hauled_gear]
+            return []
+
+        mock_er_client = mocker.MagicMock()
+        mock_er_client.get_er_gears = AsyncMock(side_effect=fake_get_er_gears)
+        mock_er_client.send_gear_to_buoy_api = AsyncMock(
+            return_value={"status": "success", "status_code": 200, "response": "{}"}
+        )
+        processor._er_client = mock_er_client
+
+        payloads = await processor.process()
+
+        # Exactly one haul payload — for the current deployed gear's set_id,
+        # carrying its no-suffix device, and NOT the stale `_A`/`_B` devices.
+        haul_payloads = [
+            p
+            for p in payloads
+            if any(d.get("device_status") == "hauled" for d in p.get("devices", []))
+        ]
+        assert len(haul_payloads) == 1
+        haul = haul_payloads[0]
+        assert haul["set_id"] == str(current_id)
+        device_ids = {d["mfr_device_id"] for d in haul["devices"]}
+        assert device_ids == {f"NDEP123_{hashed_user_id}"}
+        assert f"NDEP123_{hashed_user_id}_A" not in device_ids
+        assert f"NDEP123_{hashed_user_id}_B" not in device_ids
 
     @pytest.mark.asyncio
     async def test_process_propagates_er_gear_fetch_error(
