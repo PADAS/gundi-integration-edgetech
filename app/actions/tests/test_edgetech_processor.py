@@ -534,6 +534,126 @@ class TestEdgeTechProcessor:
         )
 
     @pytest.mark.asyncio
+    async def test_identify_buoys_haul_prefers_deployed_gear_across_name_formats(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        EdgeTech reuses serial+userId across deployment lifecycles, so ER can
+        end up with both a stale hauled gear (e.g. under the `_A` key from a
+        prior single-unit-with-end-coords deploy) and a current deployed gear
+        (e.g. under the no-suffix key from a two-unit deploy). The lookup must
+        prefer the deployed match, otherwise the recovery is wrongly skipped
+        as "already hauled in ER".
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+        primary_key = f"NDEP123_{hashed_user_id}_A"
+        standard_key = f"NDEP123_{hashed_user_id}"
+
+        stale_hauled_device = BuoyDevice(
+            device_id="stale-uuid",
+            mfr_device_id=primary_key,
+            label="Stale Hauled Device",
+            location=DeviceLocation(latitude=40.0, longitude=-70.0),
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+        )
+        stale_hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="OLD_GEAR",
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[stale_hauled_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        current_deployed_device = BuoyDevice(
+            device_id="current-uuid",
+            mfr_device_id=standard_key,
+            label="Current Deployed Device",
+            location=DeviceLocation(latitude=40.7128, longitude=-74.0060),
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        current_deployed_gear = BuoyGear(
+            id=uuid4(),
+            display_id="CURRENT_GEAR",
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[current_deployed_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {
+            primary_key: stale_hauled_gear,
+            standard_key: current_deployed_gear,
+        }
+
+        serial_number_to_edgetech_buoy = {
+            f"NDEP123/{hashed_user_id}": processor._data[0]
+        }
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert len(to_deploy) == 0
+        assert len(to_update) == 0
+        assert to_haul == {f"NDEP123/{hashed_user_id}"}
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_haul_skips_when_only_stale_hauled_gear_exists(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        When ER holds only a previously-hauled gear (no current deployment) and
+        EdgeTech also reports the buoy as not deployed, there's nothing to do —
+        the integration should skip rather than try to haul again.
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+        primary_key = f"NDEP123_{hashed_user_id}_A"
+
+        stale_hauled_device = BuoyDevice(
+            device_id="stale-uuid",
+            mfr_device_id=primary_key,
+            label="Stale Hauled Device",
+            location=DeviceLocation(latitude=40.0, longitude=-70.0),
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+        )
+        stale_hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="OLD_GEAR",
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[stale_hauled_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {primary_key: stale_hauled_gear}
+        serial_number_to_edgetech_buoy = {
+            f"NDEP123/{hashed_user_id}": processor._data[0]
+        }
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert to_deploy == set()
+        assert to_haul == set()
+        assert to_update == set()
+
+    @pytest.mark.asyncio
     async def test_identify_buoys_no_haul_for_missing_buoy(self, mocker):
         """Test that buoys missing from EdgeTech sync window are NOT identified for hauling."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")

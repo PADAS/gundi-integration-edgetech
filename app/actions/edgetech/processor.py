@@ -729,11 +729,25 @@ class EdgeTechProcessor:
 
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
 
-            # Check if gear exists in ER
-            er_gear = (
-                er_gears_devices_id_to_gear.get(primary_subject_name)
-                or er_gears_devices_id_to_gear.get(standard_subject_name)
-                or er_gears_devices_id_to_gear.get(secondary_subject_name)
+            # Check if gear exists in ER. EdgeTech has no primary key, so the
+            # same serial+userId can be reused across deployment lifecycles —
+            # ER may hold a previously-hauled gear AND a current deployed gear
+            # for the same physical buoy under different mfr_device_id formats
+            # (e.g. `_A` from a single-unit-with-end-coords deploy, no suffix
+            # from a two-unit deploy). The dedup at `er_gears_devices_id_to_gear`
+            # only collapses entries sharing a key, so we must prefer the
+            # deployed match across all three name patterns; otherwise the
+            # first-found match (e.g. a stale hauled `_A` gear) hides the
+            # current deployment and produces a false "already hauled" skip.
+            candidate_gears = [
+                er_gears_devices_id_to_gear.get(primary_subject_name),
+                er_gears_devices_id_to_gear.get(standard_subject_name),
+                er_gears_devices_id_to_gear.get(secondary_subject_name),
+            ]
+            candidate_gears = [g for g in candidate_gears if g is not None]
+            er_gear = next(
+                (g for g in candidate_gears if g.status == "deployed"),
+                candidate_gears[0] if candidate_gears else None,
             )
 
             if er_gear is None:

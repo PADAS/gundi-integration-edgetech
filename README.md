@@ -461,14 +461,28 @@ er_gears_devices_id_to_gear = {
 ```
 
 **Step 3: Match EdgeTech Buoy to ER Gear**
+
+EdgeTech has no primary key for a buoy lifecycle — the same `serialNumber + userId` is reused on every redeployment, and the suffix format depends on the deploy mode at that moment (single-unit-with-end-coords uses `_A` / `_B`; two-unit lines use no suffix). As a result, ER can simultaneously hold a stale **hauled** gear and a current **deployed** gear for the same physical buoy under **different** `mfr_device_id` keys. The dedup at `er_gears_devices_id_to_gear` (which keys on `mfr_device_id`) cannot collapse them. So the lookup must check all three name patterns and prefer a `status == "deployed"` match before falling back; otherwise a stale hauled match would hide the current deployment and produce a false "already hauled in ER, skipping" outcome.
+
 ```python
 # For each EdgeTech buoy, construct lookup keys:
-primary_key = f"{serial_number}_{hashed_user_id}_A"
-standard_key = f"{serial_number}_{hashed_user_id}"
+primary_key   = f"{serial_number}_{hashed_user_id}_A"
+standard_key  = f"{serial_number}_{hashed_user_id}"
+secondary_key = f"{serial_number}_{hashed_user_id}_B"
 
-# Look up in mapping (try primary first, then standard)
-er_gear = er_gears_devices_id_to_gear.get(primary_key) \
-       or er_gears_devices_id_to_gear.get(standard_key)
+# Collect all matches across the three patterns, prefer deployed,
+# fall back to first-found (preserves the "ER hauled + EdgeTech now
+# deployed → recovery deploy" path).
+candidates = [
+    er_gears_devices_id_to_gear.get(primary_key),
+    er_gears_devices_id_to_gear.get(standard_key),
+    er_gears_devices_id_to_gear.get(secondary_key),
+]
+candidates = [g for g in candidates if g is not None]
+er_gear = next(
+    (g for g in candidates if g.status == "deployed"),
+    candidates[0] if candidates else None,
+)
 ```
 
 ### Set ID Determination
