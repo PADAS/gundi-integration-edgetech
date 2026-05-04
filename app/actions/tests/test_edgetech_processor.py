@@ -25,17 +25,13 @@ async def test_process_new_edgetech_trawl(mocker, a_new_edgetech_trawl_record):
     # Mock the ER client to return no existing gears (new deployment)
     mock_er_client = mocker.MagicMock()
     mock_er_client.get_er_gears = AsyncMock(return_value=[])
-    mock_er_client.get_sources = AsyncMock(return_value=[])
-    mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-        return_value=None
-    )
     processor._er_client = mock_er_client
 
     # Act & Assert - The process should complete without errors
     await processor.process()
 
     # Verify that the ER client was called
-    mock_er_client.get_er_gears.assert_called_once()
+    assert mock_er_client.get_er_gears.call_count == 2
 
 
 @pytest.fixture
@@ -151,6 +147,49 @@ class TestEdgeTechProcessor:
 
         assert "start_datetime" in filters
         assert isinstance(filters["start_datetime"], datetime)
+
+    def test_lookup_er_gear_preferring_deployed(self):
+        """
+        The helper underpins every ER-gear lookup that needs to disambiguate
+        deployment lifecycles for the same serial+userId. It must prefer a
+        `status == "deployed"` match across the given keys, fall back to the
+        first non-empty hit otherwise, and return None when no key matches.
+        """
+
+        def gear(status: str) -> BuoyGear:
+            return BuoyGear(
+                id=uuid4(),
+                display_id=f"GEAR-{status}",
+                status=status,
+                last_updated=datetime.now(timezone.utc),
+                devices=[],
+                type="ropeless",
+                manufacturer="edgetech",
+            )
+
+        hauled = gear("hauled")
+        deployed = gear("deployed")
+
+        # Deployed under a later key beats hauled under an earlier key.
+        m = {"k_A": hauled, "k": deployed}
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed(m, "k_A", "k", "k_B")
+            is deployed
+        )
+
+        # Only hauled present — fallback to first non-empty hit (preserves
+        # the recovery-deploy path: ER hauled but EdgeTech now deployed).
+        m = {"k_A": hauled}
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed(m, "k_A", "k", "k_B")
+            is hauled
+        )
+
+        # No matches.
+        assert (
+            EdgeTechProcessor._lookup_er_gear_preferring_deployed({}, "k_A", "k")
+            is None
+        )
 
     def test_should_skip_buoy_deleted(self, deleted_buoy_record):
         """Test that deleted buoys are NOT skipped (needed for haul detection)."""
@@ -538,6 +577,126 @@ class TestEdgeTechProcessor:
         )
 
     @pytest.mark.asyncio
+    async def test_identify_buoys_haul_prefers_deployed_gear_across_name_formats(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        EdgeTech reuses serial+userId across deployment lifecycles, so ER can
+        end up with both a stale hauled gear (e.g. under the `_A` key from a
+        prior single-unit-with-end-coords deploy) and a current deployed gear
+        (e.g. under the no-suffix key from a two-unit deploy). The lookup must
+        prefer the deployed match, otherwise the recovery is wrongly skipped
+        as "already hauled in ER".
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+        primary_key = f"NDEP123_{hashed_user_id}_A"
+        standard_key = f"NDEP123_{hashed_user_id}"
+
+        stale_hauled_device = BuoyDevice(
+            device_id="stale-uuid",
+            mfr_device_id=primary_key,
+            label="Stale Hauled Device",
+            location=DeviceLocation(latitude=40.0, longitude=-70.0),
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+        )
+        stale_hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="OLD_GEAR",
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[stale_hauled_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        current_deployed_device = BuoyDevice(
+            device_id="current-uuid",
+            mfr_device_id=standard_key,
+            label="Current Deployed Device",
+            location=DeviceLocation(latitude=40.7128, longitude=-74.0060),
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        current_deployed_gear = BuoyGear(
+            id=uuid4(),
+            display_id="CURRENT_GEAR",
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[current_deployed_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {
+            primary_key: stale_hauled_gear,
+            standard_key: current_deployed_gear,
+        }
+
+        serial_number_to_edgetech_buoy = {
+            f"NDEP123/{hashed_user_id}": processor._data[0]
+        }
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert len(to_deploy) == 0
+        assert len(to_update) == 0
+        assert to_haul == {f"NDEP123/{hashed_user_id}"}
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_haul_skips_when_only_stale_hauled_gear_exists(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        When ER holds only a previously-hauled gear (no current deployment) and
+        EdgeTech also reports the buoy as not deployed, there's nothing to do —
+        the integration should skip rather than try to haul again.
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+        primary_key = f"NDEP123_{hashed_user_id}_A"
+
+        stale_hauled_device = BuoyDevice(
+            device_id="stale-uuid",
+            mfr_device_id=primary_key,
+            label="Stale Hauled Device",
+            location=DeviceLocation(latitude=40.0, longitude=-70.0),
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+        )
+        stale_hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="OLD_GEAR",
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[stale_hauled_device],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        er_gears_devices_id_to_gear = {primary_key: stale_hauled_gear}
+        serial_number_to_edgetech_buoy = {
+            f"NDEP123/{hashed_user_id}": processor._data[0]
+        }
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(
+            er_gears_devices_id_to_gear, serial_number_to_edgetech_buoy
+        )
+
+        assert to_deploy == set()
+        assert to_haul == set()
+        assert to_update == set()
+
+    @pytest.mark.asyncio
     async def test_identify_buoys_no_haul_for_missing_buoy(self, mocker):
         """Test that buoys missing from EdgeTech sync window are NOT identified for hauling."""
         processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
@@ -591,10 +750,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.WARNING):
@@ -630,17 +785,13 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Act & Assert - The process should complete without errors
         await processor.process()
 
         # Verify that the ER client was called
-        mock_er_client.get_er_gears.assert_called_once()
+        assert mock_er_client.get_er_gears.call_count == 2
 
     @pytest.mark.asyncio
     async def test_process_validation_error_handling(self, mocker, caplog):
@@ -683,17 +834,13 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Act
         await processor.process()
 
         # Verify that the ER client was called
-        mock_er_client.get_er_gears.assert_called_once()
+        assert mock_er_client.get_er_gears.call_count == 2
 
     @pytest.mark.asyncio
     async def test_process_creates_haul_observations(self, mocker):
@@ -723,35 +870,135 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Act
         await processor.process()
 
         # Verify that the ER client was called
-        mock_er_client.get_er_gears.assert_called_once()
+        assert mock_er_client.get_er_gears.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_process_deploy_validation_error(
+    async def test_process_haul_targets_deployed_gear_not_stale_hauled(
+        self, mocker, non_deployed_buoy_record
+    ):
+        """
+        Regression for the lifecycle-collision bug: when ER holds both a stale
+        hauled gear (e.g. from a single-unit-with-end-coords deploy with `_A`/
+        `_B` devices) and a current deployed gear (e.g. a two-unit redeploy
+        with no-suffix devices) for the same physical buoy, and EdgeTech now
+        reports the buoy as recovered, the haul payload must target the
+        current deployed gear's set_id and devices — not the stale hauled
+        one's, which would already have status="hauled" in ER and produce
+        a 400 "Device ... is already hauled" response.
+        """
+        processor = EdgeTechProcessor(
+            data=[non_deployed_buoy_record], er_token="token", er_url="url"
+        )
+
+        hashed_user_id = get_hashed_user_id("user123")
+
+        # Stale hauled gear from a prior single-unit-with-end-coords lifecycle
+        # — devices keyed `_A` and `_B`.
+        stale_id = uuid4()
+        stale_hauled_gear = BuoyGear(
+            id=stale_id,
+            display_id=str(stale_id),
+            status="hauled",
+            last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+            devices=[
+                BuoyDevice(
+                    device_id="stale-uuid-a",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}_A",
+                    label="Stale A",
+                    location=DeviceLocation(latitude=40.0, longitude=-70.0),
+                    last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+                ),
+                BuoyDevice(
+                    device_id="stale-uuid-b",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}_B",
+                    label="Stale B",
+                    location=DeviceLocation(latitude=40.1, longitude=-70.1),
+                    last_updated=datetime.now(timezone.utc) - timedelta(days=30),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=60),
+                ),
+            ],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        # Current deployed gear from a later single-unit lifecycle —
+        # device keyed without suffix.
+        current_id = uuid4()
+        current_deployed_gear = BuoyGear(
+            id=current_id,
+            display_id=str(current_id),
+            status="deployed",
+            last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            devices=[
+                BuoyDevice(
+                    device_id="current-uuid",
+                    mfr_device_id=f"NDEP123_{hashed_user_id}",
+                    label="Current",
+                    location=DeviceLocation(latitude=40.7128, longitude=-74.0060),
+                    last_updated=datetime.now(timezone.utc) - timedelta(hours=1),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=1),
+                ),
+            ],
+            type="ropeless",
+            manufacturer="edgetech",
+        )
+
+        async def fake_get_er_gears(params=None, state=None):
+            if state == "deployed":
+                return [current_deployed_gear]
+            if state == "hauled":
+                return [stale_hauled_gear]
+            return []
+
+        mock_er_client = mocker.MagicMock()
+        mock_er_client.get_er_gears = AsyncMock(side_effect=fake_get_er_gears)
+        mock_er_client.send_gear_to_buoy_api = AsyncMock(
+            return_value={"status": "success", "status_code": 200, "response": "{}"}
+        )
+        processor._er_client = mock_er_client
+
+        payloads = await processor.process()
+
+        # Exactly one haul payload — for the current deployed gear's set_id,
+        # carrying its no-suffix device, and NOT the stale `_A`/`_B` devices.
+        haul_payloads = [
+            p
+            for p in payloads
+            if any(d.get("device_status") == "hauled" for d in p.get("devices", []))
+        ]
+        assert len(haul_payloads) == 1
+        haul = haul_payloads[0]
+        assert haul["set_id"] == str(current_id)
+        device_ids = {d["mfr_device_id"] for d in haul["devices"]}
+        assert device_ids == {f"NDEP123_{hashed_user_id}"}
+        assert f"NDEP123_{hashed_user_id}_A" not in device_ids
+        assert f"NDEP123_{hashed_user_id}_B" not in device_ids
+
+    @pytest.mark.asyncio
+    async def test_process_propagates_er_gear_fetch_error(
         self, mocker, caplog, a_new_edgetech_trawl_record
     ):
-        """Test handling of errors during deployment gear payload creation."""
+        """If the ER gear fetch fails, process() must surface the error rather
+        than silently swallowing it — the source map is derived from that same
+        response, so nothing downstream can run correctly without it."""
         data = [a_new_edgetech_trawl_record]
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
         mock_er_client = mocker.MagicMock()
-        mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(
-            side_effect=Exception("Test error accessing sources")
+        mock_er_client.get_er_gears = AsyncMock(
+            side_effect=Exception("Test error fetching gears")
         )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.ERROR):
-            with pytest.raises(Exception, match="Test error accessing sources"):
+            with pytest.raises(Exception, match="Test error fetching gears"):
                 await processor.process()
 
     @pytest.mark.asyncio
@@ -792,10 +1039,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.WARNING):
@@ -878,7 +1121,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
         mock_er_client.send_gear_to_buoy_api = AsyncMock(
             return_value={"status": "success", "status_code": 200}
         )
@@ -912,6 +1154,383 @@ class TestEdgeTechProcessor:
         assert devices_by_mfr[end_device_id]["location"]["latitude"] == 40.358
         assert devices_by_mfr[end_device_id]["location"]["longitude"] == -70.959
         assert "not in sync window; using current state from ER" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_process_update_single_unit_trawl_end_only_location_change(
+        self, mocker, caplog
+    ):
+        """Single-unit-trawl Device B moves while Device A holds: must produce an update."""
+        user_id = "634431265e87a0a75163a20b"
+        hashed = get_hashed_user_id(user_id)
+        serial = "8899CEDAAA"
+
+        # Device A unchanged, Device B (endLat/endLon) moved.
+        record = {
+            "serialNumber": serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"abc"',
+                "isDeleted": False,
+                "serialNumber": serial,
+                "releaseCommand": "C8AB8C75AA",
+                "statusCommand": serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-02-15T14:56:47.660Z",
+                "lastUpdated": "2026-02-15T15:01:58.663Z",
+                "latDeg": 44.358265,  # unchanged
+                "lonDeg": -68.16757,  # unchanged
+                "endLatDeg": 44.999999,  # NEW
+                "endLonDeg": -68.999999,  # NEW
+                "isTwoUnitLine": None,
+                "endUnit": None,
+                "startUnit": None,
+            },
+            "changeRecords": [],
+        }
+        processor = EdgeTechProcessor(data=[record], er_token="t", er_url="u")
+
+        a_id = f"{serial}_{hashed}_A"
+        b_id = f"{serial}_{hashed}_B"
+        ts = datetime(2026, 2, 15, 14, 56, 48, tzinfo=timezone.utc)
+        device_a = BuoyDevice(
+            device_id=a_id,
+            mfr_device_id=a_id,
+            label="A",
+            location=DeviceLocation(latitude=44.358265, longitude=-68.16757),
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        device_b = BuoyDevice(
+            device_id=b_id,
+            mfr_device_id=b_id,
+            label="B",
+            location=DeviceLocation(latitude=44.000000, longitude=-68.000000),  # OLD
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-AB",
+            status="deployed",
+            last_updated=ts,
+            devices=[device_a, device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        mock_client = mocker.MagicMock()
+        mock_client.get_er_gears = AsyncMock(return_value=[gear])
+        processor._er_client = mock_client
+
+        with caplog.at_level(logging.INFO):
+            payloads = await processor.process()
+
+        assert len(payloads) == 1
+        devices_by_mfr = {d["mfr_device_id"]: d for d in payloads[0]["devices"]}
+        assert devices_by_mfr[b_id]["location"]["latitude"] == 44.999999
+        assert devices_by_mfr[b_id]["location"]["longitude"] == -68.999999
+        assert devices_by_mfr[a_id]["location"]["latitude"] == 44.358265
+        assert "skipping update" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_process_update_two_unit_end_record_only_location_change(
+        self, mocker, caplog
+    ):
+        """Two-unit gearset where only the end record moves: redirect must drive the
+        start record's iteration to emit an update with the end's new location."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "88CE99B71C"
+        end_serial = "88CE99CAE8"
+        early = "2026-02-15T14:56:47.660Z"
+        late = "2026-02-15T15:30:00.000Z"
+
+        start_record = {
+            "serialNumber": start_serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"start"',
+                "isDeleted": False,
+                "serialNumber": start_serial,
+                "releaseCommand": "C8AB8CEA9C",
+                "statusCommand": start_serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": early,
+                "isTwoUnitLine": True,
+                "endUnit": end_serial,
+                "startUnit": None,
+                "lastUpdated": early,  # NOT bumped
+                "latDeg": 40.357,  # unchanged
+                "lonDeg": -70.963,  # unchanged
+            },
+            "changeRecords": [],
+        }
+        end_record = {
+            "serialNumber": end_serial,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"end"',
+                "isDeleted": False,
+                "serialNumber": end_serial,
+                "releaseCommand": "C8AB8CEA9D",
+                "statusCommand": end_serial,
+                "idCommand": "CCCCCCCCCC",
+                "isNfcTag": False,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": early,
+                "isTwoUnitLine": True,
+                "endUnit": None,
+                "startUnit": start_serial,
+                "lastUpdated": late,  # bumped
+                "latDeg": 40.999,  # NEW
+                "lonDeg": -70.111,  # NEW
+            },
+            "changeRecords": [],
+        }
+        processor = EdgeTechProcessor(
+            data=[start_record, end_record], er_token="t", er_url="u"
+        )
+
+        start_id = f"{start_serial}_{hashed}"
+        end_id = f"{end_serial}_{hashed}"
+        ts = datetime(2026, 2, 15, 14, 56, 48, tzinfo=timezone.utc)
+        start_device = BuoyDevice(
+            device_id=start_id,
+            mfr_device_id=start_id,
+            label="start",
+            location=DeviceLocation(latitude=40.357, longitude=-70.963),
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        end_device = BuoyDevice(
+            device_id=end_id,
+            mfr_device_id=end_id,
+            label="end",
+            location=DeviceLocation(latitude=40.358, longitude=-70.959),  # OLD
+            last_updated=ts,
+            last_deployed=ts,
+        )
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-2U",
+            status="deployed",
+            last_updated=ts,
+            devices=[start_device, end_device],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        mock_client = mocker.MagicMock()
+        mock_client.get_er_gears = AsyncMock(return_value=[gear])
+        processor._er_client = mock_client
+
+        with caplog.at_level(logging.INFO):
+            payloads = await processor.process()
+
+        assert len(payloads) == 1
+        devices_by_mfr = {d["mfr_device_id"]: d for d in payloads[0]["devices"]}
+        assert devices_by_mfr[end_id]["location"]["latitude"] == 40.999
+        assert devices_by_mfr[end_id]["location"]["longitude"] == -70.111
+        assert devices_by_mfr[start_id]["location"]["latitude"] == 40.357
+        assert "target_key=" + f"{start_serial}/{hashed}" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_end_record_update_redirected_to_start_key(
+        self, mocker, a_new_edgetech_trawl_record
+    ):
+        """Direct check: an end-record update lands under the start record's key."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "STARTSERIAL"
+        end_serial = "ENDSERIAL"
+        early = datetime(2026, 2, 15, 14, 56, 47, tzinfo=timezone.utc)
+        late = datetime(2026, 2, 15, 15, 30, 0, tzinfo=timezone.utc)
+
+        start_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": start_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"s"',
+                    "isDeleted": False,
+                    "serialNumber": start_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": start_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": end_serial,
+                    "startUnit": None,
+                    "lastUpdated": early.isoformat(),
+                    "latDeg": 1.0,
+                    "lonDeg": 2.0,
+                },
+                "changeRecords": [],
+            }
+        )
+        end_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": end_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"e"',
+                    "isDeleted": False,
+                    "serialNumber": end_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": end_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": None,
+                    "startUnit": start_serial,
+                    "lastUpdated": late.isoformat(),
+                    "latDeg": 9.0,  # moved
+                    "lonDeg": 8.0,
+                },
+                "changeRecords": [],
+            }
+        )
+
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="G",
+            status="deployed",
+            last_updated=early,
+            devices=[
+                BuoyDevice(
+                    device_id=f"{start_serial}_{hashed}",
+                    mfr_device_id=f"{start_serial}_{hashed}",
+                    label="s",
+                    location=DeviceLocation(latitude=1.0, longitude=2.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+                BuoyDevice(
+                    device_id=f"{end_serial}_{hashed}",
+                    mfr_device_id=f"{end_serial}_{hashed}",
+                    label="e",
+                    location=DeviceLocation(latitude=3.0, longitude=4.0),  # OLD
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+            ],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        er_map = {
+            f"{start_serial}_{hashed}": gear,
+            f"{end_serial}_{hashed}": gear,
+        }
+        sn_map = {
+            f"{start_serial}/{hashed}": start_buoy,
+            f"{end_serial}/{hashed}": end_buoy,
+        }
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="t", er_url="u"
+        )
+
+        to_deploy, to_haul, to_update = await processor._identify_buoys(er_map, sn_map)
+
+        # The end-record update is redirected to the start key. The end key must
+        # NOT be in to_update (it would be skipped by is_end_unit_record otherwise).
+        assert f"{start_serial}/{hashed}" in to_update
+        assert f"{end_serial}/{hashed}" not in to_update
+
+    @pytest.mark.asyncio
+    async def test_identify_buoys_end_record_update_with_start_outside_sync_window(
+        self, mocker, caplog, a_new_edgetech_trawl_record
+    ):
+        """If the end record needs an update but the start record isn't in the sync
+        window, we can't drive the update from the start — log a warning and skip."""
+        user_id = "5f455a89e7ef8c0068db9ae1"
+        hashed = get_hashed_user_id(user_id)
+        start_serial = "STARTSERIAL"
+        end_serial = "ENDSERIAL"
+        early = datetime(2026, 2, 15, 14, 56, 47, tzinfo=timezone.utc)
+        late = datetime(2026, 2, 15, 15, 30, 0, tzinfo=timezone.utc)
+
+        end_buoy = Buoy.parse_obj(
+            {
+                "serialNumber": end_serial,
+                "userId": user_id,
+                "currentState": {
+                    "etag": '"e"',
+                    "isDeleted": False,
+                    "serialNumber": end_serial,
+                    "releaseCommand": "x",
+                    "statusCommand": end_serial,
+                    "idCommand": "y",
+                    "isNfcTag": False,
+                    "modelNumber": "5112",
+                    "isDeployed": True,
+                    "dateDeployed": early.isoformat(),
+                    "isTwoUnitLine": True,
+                    "endUnit": None,
+                    "startUnit": start_serial,
+                    "lastUpdated": late.isoformat(),
+                    "latDeg": 9.0,
+                    "lonDeg": 8.0,
+                },
+                "changeRecords": [],
+            }
+        )
+
+        gear = BuoyGear(
+            id=uuid4(),
+            display_id="G",
+            status="deployed",
+            last_updated=early,
+            devices=[
+                BuoyDevice(
+                    device_id=f"{start_serial}_{hashed}",
+                    mfr_device_id=f"{start_serial}_{hashed}",
+                    label="s",
+                    location=DeviceLocation(latitude=1.0, longitude=2.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+                BuoyDevice(
+                    device_id=f"{end_serial}_{hashed}",
+                    mfr_device_id=f"{end_serial}_{hashed}",
+                    label="e",
+                    location=DeviceLocation(latitude=3.0, longitude=4.0),
+                    last_updated=early,
+                    last_deployed=early,
+                ),
+            ],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+        er_map = {
+            f"{start_serial}_{hashed}": gear,
+            f"{end_serial}_{hashed}": gear,
+        }
+        # Only the end record is in the sync window — start is missing.
+        sn_map = {f"{end_serial}/{hashed}": end_buoy}
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="t", er_url="u"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            to_deploy, to_haul, to_update = await processor._identify_buoys(
+                er_map, sn_map
+            )
+
+        assert to_update == set()
+        assert "is not in the sync window" in caplog.text
 
     @pytest.mark.asyncio
     async def test_process_update_validation_error(
@@ -948,10 +1567,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Mock _create_gear_payload to raise ValidationError (async mock)
@@ -1002,10 +1617,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Mock _create_gear_payload to raise general Exception (async mock)
@@ -1033,10 +1644,6 @@ class TestEdgeTechProcessor:
         # This simulates a device that should be hauled but isn't found
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # Manually trigger the scenario by modifying the to_haul set
@@ -1082,7 +1689,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
         processor._er_client = mock_er_client
 
         # Mock _identify_buoys to return a haul set that will be processed
@@ -1145,10 +1751,6 @@ class TestEdgeTechProcessor:
         # No existing ER gear (new deployment scenario)
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         # The end unit should be skipped (line 258), so only start unit observations should be created
@@ -1196,10 +1798,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.WARNING):
@@ -1287,10 +1885,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[existing_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.WARNING):
@@ -1394,10 +1988,6 @@ class TestEdgeTechProcessor:
         # Mock the ER client to return the gear
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         with caplog.at_level(logging.INFO):
@@ -1631,7 +2221,6 @@ class TestEdgeTechProcessor:
 
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[mock_gear])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
         processor._er_client = mock_er_client
 
         fake_now = datetime(2026, 3, 20, 16, 0, 0, tzinfo=timezone.utc)
@@ -1743,10 +2332,6 @@ class TestEdgeTechProcessor:
         # Mock ER client to return no existing gears (deploy scenario)
         mock_er_client = mocker.MagicMock()
         mock_er_client.get_er_gears = AsyncMock(return_value=[])
-        mock_er_client.get_sources = AsyncMock(return_value=[])
-        mock_er_client.get_existing_source_id_by_manufacturer_id = AsyncMock(
-            return_value=None
-        )
         processor._er_client = mock_er_client
 
         payloads = await processor.process()
@@ -1994,3 +2579,557 @@ class TestEdgeTechProcessor:
         assert buoy_key in to_haul
         assert buoy_key in to_deploy
         assert len(to_update) == 0
+
+    def test_redeployment_haul_without_date_recovered_avoids_recorded_at_collision(
+        self,
+    ):
+        """When EdgeTech skips the haul stage (no dateRecovered anywhere) and
+        dateDeployed/lastUpdated fall in the same second, the haul payload must
+        NOT reuse lastUpdated as recorded_at — that would collide with the
+        deploy payload's recorded_at after millisecond truncation."""
+        user_id = "684b1ec1c1df05abfa78b756"
+        serial_number = "88CE99D98B"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        # Real-world data: EdgeTech skipped haul, went straight to new deployment.
+        # dateDeployed and lastUpdated are in the same second.
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": "1774708500700",
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8CDC8B",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4224917,
+                "lonDeg": -70.6649972,
+                "endLatDeg": 42.4268093,
+                "endLonDeg": -70.6696386,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-03-28T14:35:00.167Z",
+                "lastUpdated": "2026-03-28T14:35:00.700Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-28T14:35:00.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-03-05T15:15:45.573Z",
+                            "newValue": "2026-03-28T14:35:00.167Z",
+                        },
+                        {
+                            "key": "latDeg",
+                            "oldValue": 42.4275164,
+                            "newValue": 42.4224917,
+                        },
+                        {
+                            "key": "lonDeg",
+                            "oldValue": -70.6701861,
+                            "newValue": -70.6649972,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4275164, longitude=-70.6701861),
+            last_updated=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-OLD",
+            status="deployed",
+            last_updated=datetime(2026, 3, 5, 15, 15, 45, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        # Haul payload for re-deployment (is_redeployment=True)
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        # The haul recorded_at should be dateDeployed - 1s (deterministic, no
+        # collision with the deploy payload's recorded_at after truncation).
+        haul_recorded_at = haul_payload["devices"][0]["recorded_at"]
+        deploy_recorded_at = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed
+        ).isoformat()
+        expected_haul_recorded_at = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed - timedelta(seconds=1)
+        ).isoformat()
+
+        assert haul_recorded_at == expected_haul_recorded_at, (
+            f"Haul recorded_at ({haul_recorded_at}) must be dateDeployed - 1s "
+            f"({expected_haul_recorded_at})"
+        )
+        assert haul_recorded_at != deploy_recorded_at, (
+            f"Haul recorded_at ({haul_recorded_at}) must differ from deploy "
+            f"recorded_at ({deploy_recorded_at}) to avoid ER unique constraint collision"
+        )
+
+    def test_redeployment_ignores_stale_date_recovered_from_prior_lifecycle(self):
+        """When changeRecords contain a dateRecovered from a *previous* deploy/haul
+        lifecycle (before the current ER gear was even deployed), the haul payload
+        must NOT use that stale value.  It should fall through to dateDeployed - 1s.
+
+        Real-world scenario:
+          1. Deploy at March 16
+          2. Haul at April 10  (dateRecovered = April 10 19:32:59)
+          3. Deploy at April 13 19:05  (clears dateRecovered)
+          4. Re-deploy at April 13 19:09  (dateDeployed 19:05 → 19:09)
+
+        When processing step 4, the haul for the 19:05 gear must NOT use the
+        April 10 dateRecovered — that belongs to the March 16 gear's lifecycle.
+        """
+        user_id = "6228fab6b9923b00705ba333"
+        serial_number = "1234567890"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1776107382734"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "1234567899",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 41.749466138317125,
+                "lonDeg": -70.74163437237308,
+                "endLatDeg": 41.74948039627152,
+                "endLonDeg": -70.741625073152,
+                "modelNumber": "1234",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-13T19:09:28.998Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-13T19:09:42.734Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-13T19:09:42.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-04-13T19:05:54.435Z",
+                            "newValue": "2026-04-13T19:09:28.998Z",
+                        },
+                        {
+                            "key": "lastUpdated",
+                            "oldValue": "2026-04-13T19:05:54.950Z",
+                            "newValue": "2026-04-13T19:09:42.734Z",
+                        },
+                    ],
+                },
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-13T19:05:54.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": None,
+                            "newValue": "2026-04-13T19:05:54.435Z",
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": "2026-04-10T19:32:59.960Z",
+                            "newValue": None,
+                        },
+                        {"key": "isDeployed", "oldValue": False, "newValue": True},
+                    ],
+                },
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-10T19:33:00.000Z",
+                    "changes": [
+                        {
+                            "key": "dateDeployed",
+                            "oldValue": "2026-03-16T20:36:10.316Z",
+                            "newValue": None,
+                        },
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-04-10T19:32:59.960Z",
+                        },
+                        {"key": "isDeployed", "oldValue": True, "newValue": False},
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": None,
+                            "newValue": 41.70440105394446,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": None,
+                            "newValue": -70.58701236527317,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        # ER gear from the 19:05 deployment
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        mock_device = BuoyDevice(
+            device_id="existing-uuid",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(
+                latitude=41.749452004389454, longitude=-70.7414179924815
+            ),
+            last_updated=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-1905",
+            status="deployed",
+            last_updated=datetime(2026, 4, 13, 19, 5, 54, tzinfo=timezone.utc),
+            devices=[mock_device],
+            type="single",
+            manufacturer="edgetech",
+        )
+
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        haul_recorded_at = haul_payload["devices"][0]["recorded_at"]
+
+        # Must be dateDeployed - 1s (2026-04-13T19:09:27), NOT the stale
+        # April 10 dateRecovered from the prior lifecycle
+        expected = processor._remove_milliseconds(
+            buoy.currentState.dateDeployed - timedelta(seconds=1)
+        ).isoformat()
+        stale_april_10 = "2026-04-10T19:32:59+00:00"
+
+        assert haul_recorded_at != stale_april_10, (
+            f"Haul recorded_at ({haul_recorded_at}) must NOT use the stale "
+            f"April 10 dateRecovered from a prior lifecycle"
+        )
+        assert haul_recorded_at == expected, (
+            f"Haul recorded_at ({haul_recorded_at}) should be dateDeployed - 1s "
+            f"({expected})"
+        )
+
+        # Recovery location should NOT come from the stale April 10 changeRecord;
+        # it should fall back to the ER device's deployed location
+        assert haul_payload["devices"][0]["location"]["latitude"] == 41.749452004389454
+        assert haul_payload["devices"][0]["location"]["longitude"] == -70.7414179924815
+
+    def test_redeployment_haul_recorded_at_is_after_latest_device_last_deployed(self):
+        """Regression: Buoy API stores [last_deployed, recorded_at] as a per-device
+        tstzrange and rejects inverted ranges with "range lower bound must be less
+        than or equal to range upper bound".  When an ER gear has devices with
+        disparate last_deployed values (e.g. primary re-deployed but secondary still
+        reflects an older deploy), a changeRecord dateRecovered that lies *between*
+        the two device last_deployed values must NOT be used — it would produce a
+        valid range for the older device but an inverted range for the newer one.
+
+        Real-world scenario that produced a 500 from Buoy API:
+          Device 1 (ER) last_deployed = Mar 25
+          Device 2 (ER) last_deployed = Feb 3
+          changeRecord dateRecovered    = Mar 19     (between the two)
+          → Mar 19 is < Mar 25 → inverted range for Device 1 → 500 Internal Server Error
+        """
+        user_id = "6228fab6b9923b00705ba333"
+        serial_number = "88CE99D99A"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "X",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 41.4558047,
+                "lonDeg": -71.2610299,
+                "modelNumber": "1234",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-21T14:45:09.000Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-21T14:45:09.000Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-03-19T21:27:54.000Z",
+                    "changes": [
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-03-19T21:27:54.000Z",
+                        },
+                        {"key": "isDeployed", "oldValue": True, "newValue": False},
+                    ],
+                }
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}"
+        device_1 = BuoyDevice(
+            device_id="142138ca-5e12-4148-aae7-0d7ca2b2e2aa",
+            mfr_device_id=device_id_a,
+            label="Device 1",
+            location=DeviceLocation(latitude=41.4558047, longitude=-71.2610299),
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 3, 25, 4, 1, 6, tzinfo=timezone.utc),
+        )
+        device_2 = BuoyDevice(
+            device_id="a7aa9517-b1d3-4ec8-bbd1-9483f163c419",
+            mfr_device_id=device_id_a,
+            label="Device 2",
+            location=DeviceLocation(latitude=41.4558047, longitude=-71.2610299),
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 2, 3, 15, 47, 6, tzinfo=timezone.utc),
+        )
+        mock_gear = BuoyGear(
+            id=uuid4(),
+            display_id="68da0e03-3fec-4057-b697-66b395c9c153",
+            status="deployed",
+            last_updated=datetime(2026, 4, 21, 14, 45, 9, tzinfo=timezone.utc),
+            devices=[device_1, device_2],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        haul_payload = processor._create_haul_payload(
+            er_gear=mock_gear, edgetech_buoy=buoy, is_redeployment=True
+        )
+
+        # The haul recorded_at must be strictly after every device's last_deployed;
+        # otherwise Buoy API's per-device tstzrange is inverted.
+        latest_last_deployed = max(device_1.last_deployed, device_2.last_deployed)
+        for haul_device in haul_payload["devices"]:
+            recorded_at = datetime.fromisoformat(haul_device["recorded_at"])
+            last_deployed = datetime.fromisoformat(haul_device["last_deployed"])
+            assert recorded_at >= last_deployed, (
+                f"Inverted range for device {haul_device['mfr_device_id']}: "
+                f"last_deployed={last_deployed} > recorded_at={recorded_at}"
+            )
+            assert recorded_at > latest_last_deployed, (
+                f"recorded_at ({recorded_at}) must be strictly after the latest "
+                f"device last_deployed ({latest_last_deployed}) to avoid both the "
+                f"inverted-range error and the (device_id, recorded_at) unique "
+                f"constraint collision with the deploy event"
+            )
+
+        # The stale Mar 19 dateRecovered must NOT have been used
+        stale_mar_19 = "2026-03-19T21:27:54+00:00"
+        for haul_device in haul_payload["devices"]:
+            assert haul_device["recorded_at"] != stale_mar_19, (
+                f"Must not use stale dateRecovered ({stale_mar_19}) that is before "
+                f"the most recent device last_deployed"
+            )
+
+    @pytest.mark.asyncio
+    async def test_process_prefers_deployed_gear_over_hauled_for_same_device(self):
+        """When ER returns multiple gears sharing a mfr_device_id (e.g. a hauled
+        gear from a prior lifecycle plus a currently-deployed gear from the
+        latest re-deploy), the lookup must pick the deployed one. Otherwise the
+        hauled gear can win, _identify_buoys falls into the
+        ``status != 'deployed' and isDeployed`` branch, and a duplicate
+        gearset is created.
+        """
+        user_id = "6846e8f6e0488a09f1d5b39a"
+        serial_number = "88CE99D358"
+        hashed_user_id = get_hashed_user_id(user_id)
+
+        # EdgeTech currentState reflects the latest re-deploy; same dateDeployed
+        # as the deployed ER gear (no re-deployment, no update needed).
+        buoy_data = {
+            "serialNumber": serial_number,
+            "userId": user_id,
+            "currentState": {
+                "etag": '"1776336184788"',
+                "isDeleted": False,
+                "serialNumber": serial_number,
+                "releaseCommand": "C8AB8C7658",
+                "statusCommand": serial_number,
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4476378,
+                "lonDeg": -70.608329,
+                "endLatDeg": 42.455983,
+                "endLonDeg": -70.616863,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-16T10:43:04.182Z",
+                "isTwoUnitLine": False,
+                "lastUpdated": "2026-04-16T10:43:04.788Z",
+            },
+            "changeRecords": [],
+        }
+
+        processor = EdgeTechProcessor(data=[buoy_data], er_token="token", er_url="url")
+
+        device_id_a = f"{serial_number}_{hashed_user_id}_A"
+        device_id_b = f"{serial_number}_{hashed_user_id}_B"
+
+        # Hauled gear from a prior lifecycle (same device serials).
+        hauled_device_a = BuoyDevice(
+            device_id="old-uuid-a",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4487014, longitude=-70.6094034),
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 9, 14, 17, 56, tzinfo=timezone.utc),
+        )
+        hauled_device_b = BuoyDevice(
+            device_id="old-uuid-b",
+            mfr_device_id=device_id_b,
+            label="Device B",
+            location=DeviceLocation(latitude=42.4557331, longitude=-70.6168107),
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 9, 14, 17, 56, tzinfo=timezone.utc),
+        )
+        hauled_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-APRIL-9",
+            status="hauled",
+            last_updated=datetime(2026, 4, 16, 10, 34, 35, tzinfo=timezone.utc),
+            devices=[hauled_device_a, hauled_device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        # Currently-deployed gear from the April 16 re-deploy.
+        deployed_device_a = BuoyDevice(
+            device_id="new-uuid-a",
+            mfr_device_id=device_id_a,
+            label="Device A",
+            location=DeviceLocation(latitude=42.4476378, longitude=-70.608329),
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+        )
+        deployed_device_b = BuoyDevice(
+            device_id="new-uuid-b",
+            mfr_device_id=device_id_b,
+            label="Device B",
+            location=DeviceLocation(latitude=42.455983, longitude=-70.616863),
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            last_deployed=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+        )
+        deployed_gear = BuoyGear(
+            id=uuid4(),
+            display_id="GEAR-APRIL-16",
+            status="deployed",
+            last_updated=datetime(2026, 4, 16, 10, 43, 4, tzinfo=timezone.utc),
+            devices=[deployed_device_a, deployed_device_b],
+            type="trawl",
+            manufacturer="edgetech",
+        )
+
+        # Deployed gear listed first, hauled gear last — without the dedup
+        # logic, the hauled gear (last write wins in a dict comprehension)
+        # would clobber the deployed entry and trigger a duplicate deployment.
+        mock_er_client = Mock()
+        mock_er_client.get_er_gears = AsyncMock(
+            return_value=[deployed_gear, hauled_gear]
+        )
+        processor._er_client = mock_er_client
+
+        gear_payloads = await processor.process()
+
+        # No deployment payload should be generated; the deployed April 16 gear
+        # already matches the EdgeTech currentState.
+        deploy_payloads = [
+            p
+            for p in gear_payloads
+            if any(d.get("device_status") == "deployed" for d in p.get("devices", []))
+            and "initial_deployment_date" in p
+        ]
+        assert deploy_payloads == [], (
+            f"Expected no new deployment, got {len(deploy_payloads)}: "
+            f"{deploy_payloads}"
+        )
+
+    def test_change_record_helpers_accept_naive_min_date(self):
+        """BuoyDevice.last_deployed is not coerced to tz-aware, so min_date
+        passed into the change-record helpers can be naive. The helpers must
+        normalize before comparing against the tz-aware recovered_dt —
+        otherwise Python raises TypeError on naive vs aware comparison."""
+        buoy_data = {
+            "serialNumber": "88CE99D358",
+            "userId": "6846e8f6e0488a09f1d5b39a",
+            "currentState": {
+                "etag": '"x"',
+                "isDeleted": False,
+                "serialNumber": "88CE99D358",
+                "releaseCommand": "C8AB8C7658",
+                "statusCommand": "88CE99D358",
+                "idCommand": "CCCCCCCCCC",
+                "latDeg": 42.4476378,
+                "lonDeg": -70.608329,
+                "modelNumber": "5112",
+                "isDeployed": True,
+                "dateDeployed": "2026-04-16T10:43:04.182Z",
+                "lastUpdated": "2026-04-16T10:43:04.788Z",
+            },
+            "changeRecords": [
+                {
+                    "type": "MODIFY",
+                    "timestamp": "2026-04-16T10:34:35.000Z",
+                    "changes": [
+                        {
+                            "key": "dateRecovered",
+                            "oldValue": None,
+                            "newValue": "2026-04-16T09:54:07.949Z",
+                        },
+                        {
+                            "key": "recoveredLatDeg",
+                            "oldValue": None,
+                            "newValue": 42.4992445,
+                        },
+                        {
+                            "key": "recoveredLonDeg",
+                            "oldValue": None,
+                            "newValue": -70.8112983,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        buoy = Buoy.parse_obj(buoy_data)
+        # Naive datetime — simulates an ER device whose last_deployed wasn't
+        # coerced to tz-aware.
+        naive_min = datetime(2026, 4, 9, 14, 17, 56)
+
+        # Should not raise TypeError
+        result = EdgeTechProcessor._get_date_recovered_from_change_records(
+            buoy, min_date=naive_min
+        )
+        assert result == datetime(2026, 4, 16, 9, 54, 7, 949000, tzinfo=timezone.utc)
+
+        lat, lon = EdgeTechProcessor._get_recovery_location_from_change_records(
+            buoy, min_date=naive_min
+        )
+        assert lat == 42.4992445
+        assert lon == -70.8112983

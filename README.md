@@ -226,11 +226,44 @@ The `currentState` contains all current information about a buoy:
 2. **End Location**: `endLatDeg` / `endLonDeg` (for two-unit systems)
 3. **Recovery Location**: `recoveredLatDeg` / `recoveredLonDeg` (when retrieved)
 
+### Deployment Shapes
+
+EdgeTech data resolves into one of three gearset shapes. Which one applies is a property of the EdgeTech record itself; the processor branches on it when building the gear payload.
+
+| Shape | EdgeTech serials | ER devices | `deployment_type` | Distinguishing field |
+|---|---|---|---|---|
+| **Single-device** | 1 | 1 (no suffix) | `single` | only `latDeg` / `lonDeg`; no `endLatDeg` / `endLonDeg`; not `isTwoUnitLine` |
+| **Single-unit trawl** | 1 | 2 (`_A` start, `_B` end) | `trawl` | `endLatDeg` / `endLonDeg` set on the same record |
+| **Two-unit line** | 2 (paired start + end records) | 2 (each unit's own serial, no suffix) | `trawl` | `isTwoUnitLine: true` plus the `startUnit` / `endUnit` cross-reference |
+
+**Single-device deployment**: the simplest case — one buoy with one tracked location. Example:
+```json
+{
+  "serialNumber": "88CE99E9C7",
+  "currentState": {
+    "latDeg": 41.63586767394248,
+    "lonDeg": -70.91513821861791,
+    "isDeployed": true,
+    "isTwoUnitLine": null
+  }
+}
+```
+ER receives one device with `mfr_device_id = "88CE99E9C7_{hashedUserId}"` and `deployment_type: "single"`.
+
+**Single-unit trawl**: one EdgeTech buoy that records two endpoints of a trap line on the same record. The `_A` device uses `latDeg` / `lonDeg`; the `_B` device uses `endLatDeg` / `endLonDeg`. Both share the gearset.
+
+**Two-unit line**: two physical buoys, one record each, joined via `startUnit` / `endUnit` — see the next section.
+
 ### Two-Unit Line Systems
 
-EdgeTech supports buoy systems with two physical units connected by a line:
+EdgeTech represents a two-unit gearset (`isTwoUnitLine: true`) as **two separate serialNumber records**, one per physical device. Each record carries the location of its own device. The two records reference each other through `startUnit` / `endUnit`:
 
-**Start Unit Record**
+- The **start unit's** record carries `endUnit: <other-serial>` and `startUnit: null` — it points outward to the end.
+- The **end unit's** record carries `startUnit: <other-serial>` and `endUnit: null` — it points back to the start.
+
+**The startUnit serialNumber is the canonical gearset identifier.** Equivalently: the record that has `endUnit` set (and `startUnit: null`) IS the start unit, and its own `serialNumber` is the gearset id. The end-unit record exists only to supply the end-unit location for that same gearset.
+
+**Start Unit Record** (canonical — its `serialNumber` identifies the gearset)
 ```json
 {
   "serialNumber": "ET-12345",
@@ -244,7 +277,7 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 }
 ```
 
-**End Unit Record**
+**End Unit Record** (supplies end-unit location only)
 ```json
 {
   "serialNumber": "ET-12346",
@@ -258,11 +291,15 @@ EdgeTech supports buoy systems with two physical units connected by a line:
 }
 ```
 
+**Change-record behavior**: On deploy, both records flip `isDeployed: true`, populate `isTwoUnitLine: true`, and set their respective `startUnit` / `endUnit` pointers. On haul, both records null out `startUnit` / `endUnit`, `isTwoUnitLine`, `dateDeployed`, `latDeg`, and `lonDeg`, flip `isDeployed: false`, and set `dateRecovered` plus `recoveredLatDeg` / `recoveredLonDeg`. Both records share the **same** `dateRecovered` timestamp and recovered coordinates (it's a single physical recovery point); `lastUpdated` may differ by a few milliseconds between the two records.
+
+**Hauled-state caveat**: After a haul, `currentState` on either record no longer carries the pair-linkage — `startUnit`, `endUnit`, and `isTwoUnitLine` are all null. A hauled end-unit record is therefore indistinguishable from a hauled start-unit record by `currentState` alone. To recover the pair-linkage for a hauled record, inspect the most recent `MODIFY` `changeRecord` and read the `oldValue` of `startUnit` / `endUnit` / `isTwoUnitLine`. In practice, hauls are matched to ER gears via `mfr_device_id`, so the pair grouping comes from the existing ER gear set rather than from the post-haul EdgeTech state.
+
 **Processing Logic**
 - Both units share the same `userId`
-- The start unit (`startUnit: null`) initiates processing
-- The end unit (`endUnit: null`) is skipped (processed as part of start unit)
-- If end unit is missing, the start unit is skipped with a warning
+- The start unit record (`startUnit: null`, `endUnit` set) initiates processing — its serial is the gearset id
+- The end unit record (`endUnit: null`, `startUnit` set) is skipped; it is consumed as the end-location source for the start unit's gearset
+- If the end unit record is missing from the dump, the start unit is skipped with a warning
 - **Circular two-unit protection**: If the same two devices are each configured as start with the other as end (e.g. A.endUnit=B and B.endUnit=A), only one gearset is created. The duplicate start is skipped (canonical lead is the device with the smaller serial number), and a warning is logged.
 
 ---
@@ -365,7 +402,9 @@ After filtering, we compare EdgeTech data with our existing Earth Ranger records
 - Action: **Haul** the existing gear (close it), then **Deploy** a new gear set with a new `set_id`
 - **Processing order**: Haul payload is sent first, then the new deployment payload, so the previous gear is closed before the new one is created
 - **Why**: When the same serial(s) are deployed again (e.g. same two-unit pair with a new `dateDeployed`), we close the previous deployment in ER/Buoy and create a new one instead of updating the old gear in place
-- **Haul timestamp for re-deployments**: When a buoy is hauled and redeployed within seconds, the `currentState.dateRecovered` is cleared by the redeploy. In this case, the haul payload’s `recorded_at` is sourced from the most recent `dateRecovered` in `changeRecords` to avoid colliding with the deploy’s `recorded_at` (which uses `dateDeployed`). Recovery location (`recoveredLatDeg`/`recoveredLonDeg`) is also recovered from `changeRecords` in the same way.
+- **Haul timestamp for re-deployments**: The haul payload’s `recorded_at` must not collide with the deploy payload’s `recorded_at` (which uses `dateDeployed`), since both share the same `device_id` and ER enforces a `(device_id, recorded_at)` unique constraint. Timestamps are truncated to seconds (`_remove_milliseconds`), so values within the same second will collide.
+  - **With `dateRecovered` in `changeRecords`**: When a buoy is hauled and redeployed within seconds, `currentState.dateRecovered` is cleared by the redeploy. The haul `recorded_at` is sourced from the most recent `dateRecovered` in `changeRecords`. Recovery location (`recoveredLatDeg`/`recoveredLonDeg`) is also recovered from `changeRecords`.
+  - **Without `dateRecovered` (skipped haul)**: EdgeTech may skip the haul stage entirely — the gear goes straight from one deployment to another with no `dateRecovered` anywhere. In this case, `lastUpdated` and `dateDeployed` are typically within the same second (both reflect the new deployment), so the haul uses `dateDeployed - 1 second` as a deterministic `recorded_at` that is guaranteed not to collide with the deploy payload.
 
 **2a. DEPLOY (Recovery from missed deployment)**
 - Buoy exists in **both** EdgeTech and Earth Ranger, but ER gear `status` is **not** `"deployed"` (e.g. `"hauled"`)
@@ -422,14 +461,28 @@ er_gears_devices_id_to_gear = {
 ```
 
 **Step 3: Match EdgeTech Buoy to ER Gear**
+
+EdgeTech has no primary key for a buoy lifecycle — the same `serialNumber + userId` is reused on every redeployment, and the suffix format depends on the deploy mode at that moment (single-unit-with-end-coords uses `_A` / `_B`; two-unit lines use no suffix). As a result, ER can simultaneously hold a stale **hauled** gear and a current **deployed** gear for the same physical buoy under **different** `mfr_device_id` keys. The dedup at `er_gears_devices_id_to_gear` (which keys on `mfr_device_id`) cannot collapse them. So the lookup must check all three name patterns and prefer a `status == "deployed"` match before falling back; otherwise a stale hauled match would hide the current deployment and produce a false "already hauled in ER, skipping" outcome.
+
 ```python
 # For each EdgeTech buoy, construct lookup keys:
-primary_key = f"{serial_number}_{hashed_user_id}_A"
-standard_key = f"{serial_number}_{hashed_user_id}"
+primary_key   = f"{serial_number}_{hashed_user_id}_A"
+standard_key  = f"{serial_number}_{hashed_user_id}"
+secondary_key = f"{serial_number}_{hashed_user_id}_B"
 
-# Look up in mapping (try primary first, then standard)
-er_gear = er_gears_devices_id_to_gear.get(primary_key) \
-       or er_gears_devices_id_to_gear.get(standard_key)
+# Collect all matches across the three patterns, prefer deployed,
+# fall back to first-found (preserves the "ER hauled + EdgeTech now
+# deployed → recovery deploy" path).
+candidates = [
+    er_gears_devices_id_to_gear.get(primary_key),
+    er_gears_devices_id_to_gear.get(standard_key),
+    er_gears_devices_id_to_gear.get(secondary_key),
+]
+candidates = [g for g in candidates if g is not None]
+er_gear = next(
+    (g for g in candidates if g.status == "deployed"),
+    candidates[0] if candidates else None,
+)
 ```
 
 ### Set ID Determination
@@ -461,17 +514,18 @@ Case 2 - Found in ER with id="abc-123-def":
 
 ### Source ID Mapping
 
-For device-level tracking, the system also maintains a mapping from manufacturer device IDs to ER source IDs:
+For device-level tracking, the system maintains a mapping from manufacturer device IDs to ER source IDs. The map is derived from the gear-fetch response (each device on each gear carries both `mfr_device_id` and `device_id`), so no separate `/sources/` call is needed:
 
 ```python
-sources = await er_client.get_sources()  # GET /api/v1.0/sources/
+er_gears = await er_client.get_er_gears()  # GET /api/v1.0/gear/
 manufacturer_id_to_source_id = {
-    source["manufacturer_id"]: source["id"]
-    for source in sources
+    device.mfr_device_id: device.device_id
+    for gear in er_gears
+    for device in gear.devices
 }
 ```
 
-This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones.
+This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones. Sources that are not attached to any gear (orphans from a failed deploy) will not appear in the map; the next deploy for that `mfr_device_id` will mint a new source UUID.
 
 ---
 
@@ -567,14 +621,17 @@ def get_hashed_user_id(user_id: str) -> str:
 
 #### Single-Unit Buoys
 
-For standard buoys (not two-unit lines), we create **two devices** representing start and end of the trap line:
+A single-unit record (one EdgeTech serial, `isTwoUnitLine` false/null) produces either one or two ER devices, depending on whether end coordinates are present.
 
+**Single-unit trawl** (`endLatDeg` / `endLonDeg` present): two devices, one gearset, `deployment_type: "trawl"`:
 ```
-Device A: {serialNumber}_{hashedUserId}_A
-Device B: {serialNumber}_{hashedUserId}_B
+Device A: {serialNumber}_{hashedUserId}_A   (start, uses latDeg/lonDeg)
+Device B: {serialNumber}_{hashedUserId}_B   (end,   uses endLatDeg/endLonDeg)
 ```
 
-**Example**:
+**Single-device deployment** (`endLatDeg` / `endLonDeg` absent): one device, `deployment_type: "single"`. No `_A`/`_B` suffix — the lone device's `mfr_device_id` is just `{serialNumber}_{hashedUserId}`.
+
+**Example** (single-unit trawl):
 ```
 EdgeTech Data:
   serialNumber: "8899CEDAAA"
@@ -589,8 +646,7 @@ Device B: 8899CEDAAA_a1b2c3d4_B (end point - uses endLatDeg/endLonDeg)
 **Gear Payload Notes**:
 - Both devices share the same `set_id`
 - Device A uses `latDeg` / `lonDeg`
-- Device B uses `endLatDeg` / `endLonDeg` (if present)
-- If end coordinates missing, only Device A is created (deployment_type="single")
+- Device B uses `endLatDeg` / `endLonDeg`
 
 #### Two-Unit Line Buoys
 
@@ -1111,9 +1167,8 @@ await log_action_activity(
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1.0/gear/` | GET | List existing buoy gears (filtered by manufacturer=edgetech) |
+| `/api/v1.0/gear/` | GET | List existing buoy gears (filtered by manufacturer=edgetech); source map is derived from the embedded device list |
 | `/api/v1.0/gear/` | POST | Create or update gear sets |
-| `/api/v1.0/sources/` | GET | List existing sources (for device_id mapping) |
 
 ### Response Codes
 
@@ -1134,7 +1189,7 @@ This integration provides robust synchronization between EdgeTech's Trap Tracker
 ✅ **Efficient database dump** mechanism for bulk data retrieval
 ✅ **Intelligent filtering** to process active and explicitly hauled buoys
 ✅ **Explicit status-based haul detection** (not inferred from absence)
-✅ **Re-deployment handling**: when EdgeTech `dateDeployed` is meaningfully later than ER’s deployment, we close the previous gear and create a new one (hauls sent before new deployments). Haul timestamps and recovery locations are sourced from `changeRecords` when a rapid haul+redeploy clears `currentState`.
+✅ **Re-deployment handling**: when EdgeTech `dateDeployed` is meaningfully later than ER’s deployment, we close the previous gear and create a new one (hauls sent before new deployments). Haul timestamps and recovery locations are sourced from `changeRecords` when a rapid haul+redeploy clears `currentState`. When EdgeTech skips the haul stage entirely (no `dateRecovered` anywhere), the synthetic haul uses `dateDeployed - 1s` as a deterministic `recorded_at` to avoid collisions with the deploy payload.
 ✅ **Recovery from missed deployments**: if a re-deployment haul succeeded but the deploy failed, subsequent runs detect the hauled ER gear vs deployed EdgeTech state and create the missing deployment
 ✅ **Set ID resolution** to correctly update existing vs create new gear sets
 ✅ **Support for complex systems** including two-unit lines

@@ -64,6 +64,33 @@ class EdgeTechProcessor:
         """
         return dt.replace(microsecond=0)
 
+    @staticmethod
+    def _lookup_er_gear_preferring_deployed(
+        er_gears_devices_id_to_gear: Dict[str, BuoyGear],
+        *keys: str,
+    ) -> Optional[BuoyGear]:
+        """
+        Look up an ER gear by trying each `mfr_device_id` key in order, but
+        prefer a `status == "deployed"` match over a hauled one.
+
+        EdgeTech has no primary key for a buoy lifecycle — the same
+        serial+userId is reused across deployments, and the device-id suffix
+        format depends on the deploy mode at the time (no suffix for two-unit
+        lines, `_A`/`_B` for single-unit-with-end-coords). ER can therefore
+        hold a stale hauled gear AND a current deployed gear for the same
+        physical buoy under different keys, and the dedup at
+        `er_gears_devices_id_to_gear` (which keys on `mfr_device_id`) cannot
+        collapse them. Falling back to the first non-empty hit when no
+        deployed match exists preserves the recovery-deploy path where ER
+        is hauled but EdgeTech is now deployed.
+        """
+        candidates = [er_gears_devices_id_to_gear.get(k) for k in keys]
+        candidates = [g for g in candidates if g is not None]
+        return next(
+            (g for g in candidates if g.status == "deployed"),
+            candidates[0] if candidates else None,
+        )
+
     async def _create_gear_payload(
         self,
         buoy: Buoy,
@@ -113,16 +140,9 @@ class EdgeTechProcessor:
         main_device_id = f"{buoy.serialNumber}_{hashed_user_id}"
 
         secondary_device_id = None
-        if buoy.currentState.endLatDeg and buoy.currentState.endLonDeg:
-            main_device_id += "_A"
-            secondary_device_id = f"{buoy.serialNumber}_{hashed_user_id}_B"
-            secondary_latitude = buoy.currentState.endLatDeg
-            secondary_longitude = buoy.currentState.endLonDeg
-            secondary_last_deployed = last_deployed
-            secondary_recorded_at = deployment_recorded_at
-            secondary_device_additional_data = json.loads(buoy.json())
-            secondary_device_additional_data.pop("changeRecords", None)
-        elif end_unit_buoy:
+        # Two-unit gearset branches lead so they win even if a two-unit start
+        # record ever populates endLatDeg/endLonDeg (which today it does not).
+        if end_unit_buoy:
             secondary_device_id = f"{end_unit_buoy.serialNumber}_{hashed_user_id}"
             secondary_latitude = end_unit_buoy.currentState.latDeg
             secondary_longitude = end_unit_buoy.currentState.lonDeg
@@ -164,6 +184,17 @@ class EdgeTechProcessor:
                     else None
                 ),
             }
+        elif buoy.currentState.endLatDeg and buoy.currentState.endLonDeg:
+            # Single-unit buoy with start+end coordinates: emit two devices
+            # under one gearset (suffixed _A / _B).
+            main_device_id += "_A"
+            secondary_device_id = f"{buoy.serialNumber}_{hashed_user_id}_B"
+            secondary_latitude = buoy.currentState.endLatDeg
+            secondary_longitude = buoy.currentState.endLonDeg
+            secondary_last_deployed = last_deployed
+            secondary_recorded_at = deployment_recorded_at
+            secondary_device_additional_data = json.loads(buoy.json())
+            secondary_device_additional_data.pop("changeRecords", None)
 
         main_device = {
             "device_id": manufacturer_id_to_source_id.get(main_device_id)
@@ -231,7 +262,10 @@ class EdgeTechProcessor:
         return payload
 
     def _create_haul_payload(
-        self, er_gear: BuoyGear, edgetech_buoy: Optional[Buoy] = None
+        self,
+        er_gear: BuoyGear,
+        edgetech_buoy: Optional[Buoy] = None,
+        is_redeployment: bool = False,
     ) -> Dict[str, Any]:
         """
         Create a haul payload from an existing ER gear.
@@ -242,6 +276,11 @@ class EdgeTechProcessor:
         Args:
             er_gear: The existing gear from ER
             edgetech_buoy: Optional EdgeTech buoy data with potential recovery location
+            is_redeployment: Whether this haul is part of a re-deployment sequence.
+                When True and no dateRecovered is found, uses dateDeployed - 1s
+                as a deterministic recorded_at instead of falling back to
+                lastUpdated, which could collide with the subsequent deploy
+                payload's recorded_at after millisecond truncation.
 
         Returns:
             Dict in the format expected by /api/v1/gear/ POST endpoint
@@ -254,10 +293,31 @@ class EdgeTechProcessor:
         recovery_lon = None
 
         # Determine the recorded_at timestamp for the haul event
-        # Use dateRecovered if available; for re-deployments (haul then immediate
-        # redeploy) the currentState dateRecovered is cleared, so check changeRecords
-        # for the most recent dateRecovered value. Fall back to lastUpdated.
-        haul_recorded_at = datetime.now(timezone.utc)
+        # Priority: dateRecovered from currentState → dateRecovered from changeRecords
+        # → dateDeployed - 1s (re-deployments without dateRecovered) → lastUpdated.
+        #
+        # For re-deployments, only consider changeRecord dateRecovered values that
+        # occurred *after* the most recent deployment among the ER gear's devices.
+        # Using max() (not min()) guarantees haul_recorded_at >= every device's
+        # last_deployed — Buoy API stores [last_deployed, recorded_at] as a
+        # tstzrange per device and rejects an inverted range. Devices in the
+        # same gearset can legitimately have different last_deployed values
+        # (e.g. end unit's own dateDeployed), so the earliest date is an unsafe
+        # floor: a recovery between the earliest and latest deploys passes
+        # min() but produces an inverted range for the later-deployed device.
+        haul_recorded_at = self._utcnow()
+        er_deployment_dates = [
+            d.last_deployed
+            for d in er_gear.devices
+            if isinstance(getattr(d, "last_deployed", None), datetime)
+        ]
+        max_er_deployment_date: Optional[datetime] = (
+            max(er_deployment_dates) if er_deployment_dates else None
+        )
+        change_record_min_date: Optional[datetime] = (
+            max_er_deployment_date if is_redeployment else None
+        )
+
         if edgetech_buoy:
             if edgetech_buoy.currentState.dateRecovered:
                 haul_recorded_at = edgetech_buoy.currentState.dateRecovered
@@ -266,7 +326,9 @@ class EdgeTechProcessor:
                 # was overwritten by the redeploy, but the haul timestamp is preserved
                 # in the change history)
                 recovered_at_from_changes = (
-                    self._get_date_recovered_from_change_records(edgetech_buoy)
+                    self._get_date_recovered_from_change_records(
+                        edgetech_buoy, min_date=change_record_min_date
+                    )
                 )
                 if recovered_at_from_changes:
                     haul_recorded_at = recovered_at_from_changes
@@ -274,8 +336,41 @@ class EdgeTechProcessor:
                         f"Using dateRecovered from changeRecords for haul of "
                         f"{edgetech_buoy.serialNumber}: {recovered_at_from_changes}"
                     )
+                elif is_redeployment and edgetech_buoy.currentState.dateDeployed:
+                    # For re-deployments without dateRecovered, lastUpdated and
+                    # dateDeployed are typically in the same second (both reflect
+                    # the new deployment). Use dateDeployed - 1s as a deterministic
+                    # haul timestamp that is guaranteed not to collide with the
+                    # deploy payload's recorded_at after millisecond truncation.
+                    haul_recorded_at = (
+                        edgetech_buoy.currentState.dateDeployed - timedelta(seconds=1)
+                    )
                 elif edgetech_buoy.currentState.lastUpdated:
                     haul_recorded_at = edgetech_buoy.currentState.lastUpdated
+
+        # Safety clamp: Buoy API builds a per-device tstzrange
+        # [last_deployed, recorded_at] and rejects inverted ranges with
+        # "range lower bound must be less than or equal to range upper bound".
+        # If upstream data produced a haul_recorded_at older than any device's
+        # last_deployed (e.g. anomalous ER state where devices in the same
+        # gearset have disparate deployment dates), bump recorded_at to
+        # max(last_deployed) + 1s. The +1s avoids colliding with the original
+        # deploy event on the (device_id, recorded_at) uniqueness constraint
+        # after the millisecond-truncation step in the payload builder.
+        if (
+            max_er_deployment_date is not None
+            and haul_recorded_at <= max_er_deployment_date
+        ):
+            clamped = max_er_deployment_date + timedelta(seconds=1)
+            logger.warning(
+                "Haul recorded_at (%s) is not after max device last_deployed (%s) "
+                "for gear %s; clamping to %s to keep the deploy/haul range valid.",
+                haul_recorded_at,
+                max_er_deployment_date,
+                er_gear.display_id,
+                clamped,
+            )
+            haul_recorded_at = clamped
 
         if edgetech_buoy:
             if (
@@ -289,7 +384,7 @@ class EdgeTechProcessor:
                 # Re-deployment: recovery location may be in changeRecords
                 # (currentState was overwritten by the redeploy)
                 rec_lat, rec_lon = self._get_recovery_location_from_change_records(
-                    edgetech_buoy
+                    edgetech_buoy, min_date=change_record_min_date
                 )
                 if rec_lat is not None and rec_lon is not None:
                     recovery_location_available = True
@@ -323,9 +418,7 @@ class EdgeTechProcessor:
                     if device.last_deployed
                     else device.last_updated.isoformat()
                 ),
-                "last_updated": self._remove_milliseconds(
-                    datetime.now(timezone.utc)
-                ).isoformat(),
+                "last_updated": self._remove_milliseconds(self._utcnow()).isoformat(),
                 "recorded_at": self._remove_milliseconds(haul_recorded_at).isoformat(),
                 "device_status": "hauled",
                 "location": {
@@ -343,6 +436,73 @@ class EdgeTechProcessor:
         }
 
         return payload
+
+    @staticmethod
+    def _expected_device_locations(
+        buoy: Buoy,
+        end_unit_buoy: Optional[Buoy],
+        end_unit_device_from_er: Optional[BuoyDevice],
+        hashed_user_id: str,
+    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        # Map every ER mfr_device_id we expect to publish for this gearset to
+        # its intended (lat, lon) from the current EdgeTech state. The update
+        # loop diffs this against the live ER gear to decide whether anything
+        # actually moved — covers single-device, single-unit-trawl (A/B), and
+        # two-unit (paired records) shapes uniformly.
+        expected: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        primary_id = f"{buoy.serialNumber}_{hashed_user_id}"
+        primary_loc = (buoy.currentState.latDeg, buoy.currentState.lonDeg)
+
+        if end_unit_buoy is not None:
+            expected[primary_id] = primary_loc
+            expected[f"{end_unit_buoy.serialNumber}_{hashed_user_id}"] = (
+                end_unit_buoy.currentState.latDeg,
+                end_unit_buoy.currentState.lonDeg,
+            )
+        elif end_unit_device_from_er is not None:
+            # End record absent from sync window; only the start side carries
+            # new data so we only diff the primary device.
+            expected[primary_id] = primary_loc
+        elif (
+            buoy.currentState.endLatDeg is not None
+            and buoy.currentState.endLonDeg is not None
+        ):
+            expected[f"{primary_id}_A"] = primary_loc
+            expected[f"{primary_id}_B"] = (
+                buoy.currentState.endLatDeg,
+                buoy.currentState.endLonDeg,
+            )
+        else:
+            expected[primary_id] = primary_loc
+
+        return expected
+
+    @staticmethod
+    def _gearset_location_changed(
+        er_gear: BuoyGear,
+        expected_locations: Dict[str, Tuple[Optional[float], Optional[float]]],
+    ) -> bool:
+        # Match each ER device to an expected entry by mfr_device_id, tolerating
+        # `_A`/`_B` suffix mismatches: a gearset previously deployed as
+        # single-unit-trawl (devices stored with `_A`/`_B`) may now be reporting
+        # as two-unit (no suffix) and vice versa. The serial-prefix is the
+        # stable identifier across shape transitions.
+        for er_device in er_gear.devices:
+            mfr_id = er_device.mfr_device_id
+            expected = expected_locations.get(mfr_id)
+            if expected is None and (mfr_id.endswith("_A") or mfr_id.endswith("_B")):
+                expected = expected_locations.get(mfr_id[:-2])
+            if expected is None:
+                stripped_candidates = (f"{mfr_id}_A", f"{mfr_id}_B")
+                for candidate in stripped_candidates:
+                    if candidate in expected_locations:
+                        expected = expected_locations[candidate]
+                        break
+            if expected is None:
+                continue
+            if (er_device.location.latitude, er_device.location.longitude) != expected:
+                return True
+        return False
 
     def _is_hauled_or_recovered(self, record: Buoy) -> bool:
         """
@@ -366,7 +526,9 @@ class EdgeTechProcessor:
         )
 
     @staticmethod
-    def _get_date_recovered_from_change_records(buoy: Buoy) -> Optional[datetime]:
+    def _get_date_recovered_from_change_records(
+        buoy: Buoy, min_date: Optional[datetime] = None
+    ) -> Optional[datetime]:
         """
         Find the most recent dateRecovered value from a buoy's changeRecords.
 
@@ -374,9 +536,20 @@ class EdgeTechProcessor:
         immediately redeployed — the currentState no longer has dateRecovered
         (cleared by the redeploy), but the changeRecords preserve the haul timestamp.
 
+        Args:
+            buoy: The buoy record to search.
+            min_date: If provided, only consider dateRecovered values that are
+                after this date.  Used during re-deployments to exclude stale
+                recovery dates from a previous deploy/haul lifecycle.
+
         Returns:
             The most recent dateRecovered datetime, or None if not found.
         """
+        # recovered_dt is always tz-aware (we append +00:00), but min_date can
+        # come from BuoyDevice.last_deployed which pydantic does not coerce to
+        # tz-aware. Normalize naive → UTC to avoid a TypeError on comparison.
+        if min_date is not None and min_date.tzinfo is None:
+            min_date = min_date.replace(tzinfo=timezone.utc)
         most_recent = None
         for record in buoy.changeRecords:
             for change in record.changes:
@@ -385,6 +558,8 @@ class EdgeTechProcessor:
                         recovered_dt = datetime.fromisoformat(
                             str(change.newValue).replace("Z", "+00:00")
                         )
+                        if min_date and recovered_dt < min_date:
+                            continue
                         if most_recent is None or recovered_dt > most_recent:
                             most_recent = recovered_dt
                     except (ValueError, TypeError):
@@ -394,6 +569,7 @@ class EdgeTechProcessor:
     @staticmethod
     def _get_recovery_location_from_change_records(
         buoy: Buoy,
+        min_date: Optional[datetime] = None,
     ) -> Tuple[Optional[float], Optional[float]]:
         """
         Find the most recent recovery location from a buoy's changeRecords.
@@ -401,9 +577,20 @@ class EdgeTechProcessor:
         Needed for re-deployment scenarios where recoveredLatDeg/recoveredLonDeg
         in currentState were cleared by the redeploy.
 
+        Args:
+            buoy: The buoy record to search.
+            min_date: If provided, only consider recovery records whose
+                dateRecovered value is after this date.  Used during
+                re-deployments to exclude stale data from a prior lifecycle.
+
         Returns:
             Tuple of (latitude, longitude) or (None, None) if not found.
         """
+        # recovered_dt is always tz-aware (we append +00:00), but min_date can
+        # come from BuoyDevice.last_deployed which pydantic does not coerce to
+        # tz-aware. Normalize naive → UTC to avoid a TypeError on comparison.
+        if min_date is not None and min_date.tzinfo is None:
+            min_date = min_date.replace(tzinfo=timezone.utc)
         # Find the changeRecord that set dateRecovered most recently —
         # its sibling entries will have the recovery coordinates.
         best_timestamp = None
@@ -412,15 +599,24 @@ class EdgeTechProcessor:
         for record in buoy.changeRecords:
             lat = None
             lon = None
-            has_recovery = False
+            recovered_dt = None
             for change in record.changes:
                 if change.key == "dateRecovered" and change.newValue is not None:
-                    has_recovery = True
+                    try:
+                        recovered_dt = datetime.fromisoformat(
+                            str(change.newValue).replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        pass
                 elif change.key == "recoveredLatDeg" and change.newValue is not None:
                     lat = change.newValue
                 elif change.key == "recoveredLonDeg" and change.newValue is not None:
                     lon = change.newValue
-            if has_recovery and lat is not None and lon is not None:
+            if recovered_dt is None:
+                continue
+            if min_date and recovered_dt < min_date:
+                continue
+            if lat is not None and lon is not None:
                 if best_timestamp is None or record.timestamp > best_timestamp:
                     best_timestamp = record.timestamp
                     best_lat = lat
@@ -508,7 +704,7 @@ class EdgeTechProcessor:
         latest: Dict[str, Buoy] = {}
 
         for record in data:
-            key = f"{record.serialNumber}{record.userId}"
+            key = f"{record.serialNumber}/{record.userId}"
             prev = latest.get(key)
             if (
                 prev is None
@@ -560,11 +756,11 @@ class EdgeTechProcessor:
 
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
 
-            # Check if gear exists in ER
-            er_gear = (
-                er_gears_devices_id_to_gear.get(primary_subject_name)
-                or er_gears_devices_id_to_gear.get(standard_subject_name)
-                or er_gears_devices_id_to_gear.get(secondary_subject_name)
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_subject_name,
+                standard_subject_name,
+                secondary_subject_name,
             )
 
             if er_gear is None:
@@ -674,10 +870,29 @@ class EdgeTechProcessor:
                     # collide after _remove_milliseconds truncation.
 
                     if location_changed or has_newer_data:
-                        to_update.add(serial_number_user_id)
+                        target_key = serial_number_user_id
+                        if edgetech_buoy.is_end_unit_record:
+                            # End-unit record can't drive an update on its own
+                            # (the update loop skips end-unit iterations), so
+                            # redirect to its start record's key. The start's
+                            # iteration diffs both devices' locations against ER
+                            # and emits the gearset update if either moved.
+                            candidate_start_key = f"{edgetech_buoy.currentState.startUnit}/{hashed_user_id}"
+                            if candidate_start_key in serial_number_to_edgetech_buoy:
+                                target_key = candidate_start_key
+                            else:
+                                logger.warning(
+                                    "End-unit record %s flagged for update but its start "
+                                    "record %s is not in the sync window; update skipped.",
+                                    serial_number_user_id,
+                                    candidate_start_key,
+                                )
+                                continue
+                        to_update.add(target_key)
                         logger.info(
                             f"Buoy {serial_number_user_id} marked for update "
-                            f"(location_changed={location_changed}, has_newer_data={has_newer_data})"
+                            f"(location_changed={location_changed}, has_newer_data={has_newer_data}; "
+                            f"target_key={target_key})"
                         )
 
         logger.info(f"Buoys to deploy: {len(to_deploy)} - {to_deploy}")
@@ -787,23 +1002,59 @@ class EdgeTechProcessor:
             serial_number_to_edgetech_buoy
         )
 
-        # Fetch all sources once and create a mapping for efficient lookups
-        logger.info("Fetching all sources from Buoy API...")
-        sources = await self._er_client.get_sources(params={"page_size": 10000})
+        # Fetch all existing gears from ER to compare against EdgeTech data.
+        # The /gear/ endpoint defaults to state=deployed, so hauled gears must
+        # be requested explicitly — we need them both for the source-ID map
+        # (re-deployments reuse source UUIDs that live on the previously-hauled
+        # gear) and for the hauled-vs-deployed dedup below (line ~908).
+        logger.info("Fetching all gears from EarthRanger (deployed + hauled)...")
+        deployed_gears = await self._er_client.get_er_gears(
+            params={"page_size": 10000}, state="deployed"
+        )
+        hauled_gears = await self._er_client.get_er_gears(
+            params={"page_size": 10000}, state="hauled"
+        )
+        er_gears = deployed_gears + hauled_gears
+        logger.info(
+            f"Fetched {len(deployed_gears)} deployed and {len(hauled_gears)} "
+            f"hauled gears from EarthRanger"
+        )
+
+        # Build mfr_device_id → source UUID map from gear devices across both
+        # states. Avoids a separate /sources/ call that would require extra
+        # permissions. If the same mfr_device_id appears on multiple gears
+        # (e.g. hauled-then-redeployed), every occurrence maps to the same
+        # underlying source UUID, so dict overwrite is fine.
         manufacturer_id_to_source_id = {
-            source.get("manufacturer_id"): source.get("id")
-            for source in sources
-            if source.get("manufacturer_id")
+            device.mfr_device_id: device.device_id
+            for gear in er_gears
+            for device in gear.devices
         }
-        logger.info(f"Loaded {len(manufacturer_id_to_source_id)} source mappings")
+        logger.info(
+            f"Derived {len(manufacturer_id_to_source_id)} source mappings from ER gears"
+        )
 
-        # Fetch all existing gears from ER to compare against EdgeTech data
-        logger.info("Fetching all gears from EarthRanger...")
-        er_gears = await self._er_client.get_er_gears(params={"page_size": 10000})
-
-        er_gears_devices_id_to_gear = {
-            device.mfr_device_id: gear for gear in er_gears for device in gear.devices
-        }
+        # Multiple ER gears can share a mfr_device_id (e.g. a hauled gear from a
+        # prior lifecycle plus a currently-deployed gear). Prefer the deployed
+        # gear; among same-status gears, prefer the most recently updated.
+        # Without this, a leftover hauled gear could win the lookup and trick
+        # _identify_buoys into creating a duplicate deployment.
+        er_gears_devices_id_to_gear: Dict[str, BuoyGear] = {}
+        for gear in er_gears:
+            for device in gear.devices:
+                existing = er_gears_devices_id_to_gear.get(device.mfr_device_id)
+                if existing is None:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
+                    continue
+                existing_deployed = existing.status == "deployed"
+                gear_deployed = gear.status == "deployed"
+                if existing_deployed and not gear_deployed:
+                    continue
+                if gear_deployed and not existing_deployed:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
+                    continue
+                if gear.last_updated > existing.last_updated:
+                    er_gears_devices_id_to_gear[device.mfr_device_id] = gear
 
         to_deploy, to_haul, to_update = await self._identify_buoys(
             er_gears_devices_id_to_gear,
@@ -824,9 +1075,11 @@ class EdgeTechProcessor:
             edgetech_buoy = serial_number_to_edgetech_buoy.get(serial_number_user_id)
 
             # Find the corresponding ER gear
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_device_name,
+                single_device_name,
+            )
 
             if not er_gear:
                 logger.warning(
@@ -847,7 +1100,9 @@ class EdgeTechProcessor:
 
             try:
                 payload = self._create_haul_payload(
-                    er_gear=er_gear, edgetech_buoy=edgetech_buoy
+                    er_gear=er_gear,
+                    edgetech_buoy=edgetech_buoy,
+                    is_redeployment=serial_number_user_id in to_deploy,
                 )
                 gear_payloads.append(payload)
                 haul_gears_processed.add(er_gear.display_id)
@@ -867,6 +1122,11 @@ class EdgeTechProcessor:
         # Process deployments (new gear sets)
         for serial_number_user_id in to_deploy:
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
+
+            if edgetech_buoy.is_end_unit_record:
+                # Partner record of a two-unit gearset; the start unit's iteration
+                # builds the full payload using this record's location.
+                continue
 
             try:
                 # Get end unit buoy if this is a two-unit line
@@ -889,10 +1149,10 @@ class EdgeTechProcessor:
                             f"{edgetech_buoy.currentState.endUnit}"
                             f"_{get_hashed_user_id(edgetech_buoy.userId)}"
                         )
-                        er_gear = er_gears_devices_id_to_gear.get(
-                            f"{serial_number_user_id.replace('/', '_')}_A"
-                        ) or er_gears_devices_id_to_gear.get(
-                            serial_number_user_id.replace("/", "_")
+                        er_gear = self._lookup_er_gear_preferring_deployed(
+                            er_gears_devices_id_to_gear,
+                            f"{serial_number_user_id.replace('/', '_')}_A",
+                            serial_number_user_id.replace("/", "_"),
                         )
                         if er_gear:
                             for er_device in er_gear.devices:
@@ -914,10 +1174,6 @@ class EdgeTechProcessor:
                                 serial_number_user_id,
                             )
                             continue
-
-                if edgetech_buoy.currentState.startUnit:
-                    # This record is for the end unit, skip it (will be handled by start unit)
-                    continue
 
                 if serial_number_user_id in circular_two_unit_skip_keys:
                     logger.warning(
@@ -949,14 +1205,19 @@ class EdgeTechProcessor:
         # Process updates (existing gear sets with location changes)
         for serial_number_user_id in to_update:
             edgetech_buoy = serial_number_to_edgetech_buoy[serial_number_user_id]
-            edgetech_buoy_lat = edgetech_buoy.currentState.latDeg
-            edgetech_buoy_long = edgetech_buoy.currentState.lonDeg
+
+            if edgetech_buoy.is_end_unit_record:
+                # Partner record of a two-unit gearset; the start unit's iteration
+                # builds the full update payload.
+                continue
 
             primary_device_name = f"{serial_number_user_id.replace('/', '_')}_A"
             single_device_name = f"{serial_number_user_id.replace('/', '_')}"
-            er_gear = er_gears_devices_id_to_gear.get(
-                primary_device_name
-            ) or er_gears_devices_id_to_gear.get(single_device_name)
+            er_gear = self._lookup_er_gear_preferring_deployed(
+                er_gears_devices_id_to_gear,
+                primary_device_name,
+                single_device_name,
+            )
 
             if not er_gear:
                 logger.warning(
@@ -964,36 +1225,15 @@ class EdgeTechProcessor:
                 )
                 continue
 
-            # Find device location in ER gear
-            er_device_lat = None
-            er_device_long = None
-            for er_device in er_gear.devices:
-                if (
-                    er_device.mfr_device_id == primary_device_name
-                    or er_device.mfr_device_id == single_device_name
-                ):
-                    er_device_lat = er_device.location.latitude
-                    er_device_long = er_device.location.longitude
-                    break
-
-            if (
-                er_device_lat == edgetech_buoy_lat
-                and er_device_long == edgetech_buoy_long
-            ):
-                # No change in location, skip update
-                logger.info(
-                    "No change in location for buoy %s, skipping update.",
-                    serial_number_user_id,
-                )
-                continue
-
             try:
-                # Get end unit buoy if this is a two-unit line
+                hashed_user_id = get_hashed_user_id(edgetech_buoy.userId)
                 end_unit_buoy = None
                 end_unit_device_from_er = None
                 if edgetech_buoy.currentState.isTwoUnitLine:
                     if edgetech_buoy.currentState.endUnit:
-                        end_unit_buoy_key = f"{edgetech_buoy.currentState.endUnit}/{get_hashed_user_id(edgetech_buoy.userId)}"
+                        end_unit_buoy_key = (
+                            f"{edgetech_buoy.currentState.endUnit}/{hashed_user_id}"
+                        )
                         end_unit_buoy = serial_number_to_edgetech_buoy.get(
                             end_unit_buoy_key
                         )
@@ -1002,7 +1242,9 @@ class EdgeTechProcessor:
                             # End unit not in sync window (e.g. only start unit had location update).
                             # Use end unit's current state from ER so we can still push the update.
                             # Match by mfr_device_id: same format as when we create the payload.
-                            end_unit_mfr_id = f"{edgetech_buoy.currentState.endUnit}_{get_hashed_user_id(edgetech_buoy.userId)}"
+                            end_unit_mfr_id = (
+                                f"{edgetech_buoy.currentState.endUnit}_{hashed_user_id}"
+                            )
                             for er_device in er_gear.devices:
                                 if er_device.mfr_device_id == end_unit_mfr_id:
                                     end_unit_device_from_er = er_device
@@ -1020,9 +1262,21 @@ class EdgeTechProcessor:
                                 serial_number_user_id,
                             )
 
-                    if edgetech_buoy.currentState.startUnit:
-                        # This record is for the end unit, skip it
-                        continue
+                # Diff every device in the gearset, not just the primary —
+                # single-unit-trawl Device B (endLatDeg/endLonDeg) and
+                # two-unit end records can move while the start holds.
+                expected_locations = self._expected_device_locations(
+                    edgetech_buoy,
+                    end_unit_buoy,
+                    end_unit_device_from_er,
+                    hashed_user_id,
+                )
+                if not self._gearset_location_changed(er_gear, expected_locations):
+                    logger.info(
+                        "No change in location for buoy %s (no device moved), skipping update.",
+                        serial_number_user_id,
+                    )
+                    continue
 
                 if serial_number_user_id in circular_two_unit_skip_keys:
                     logger.warning(
