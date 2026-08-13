@@ -38,7 +38,7 @@ jobs:
 
 
   deploy_dev:
-    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2
+    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2.1
     if: startsWith(github.ref, 'refs/heads/main')
     needs: [vars, build]
     with:
@@ -51,7 +51,7 @@ jobs:
       ssh-key: ${{ secrets.GUNDI_INTEGRATIONS_DEPLOY_KEY }}
 
   deploy_stage:
-    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2
+    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2.1
     if: startsWith(github.ref, 'refs/heads/release')
     needs: [vars, build]
     with:
@@ -64,7 +64,7 @@ jobs:
       ssh-key: ${{ secrets.GUNDI_INTEGRATIONS_DEPLOY_KEY }}
 
   deploy_prod:
-    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2
+    uses: PADAS/gundi-workflows/.github/workflows/update_hcl.yml@v2.1
     if: startsWith(github.ref, 'refs/heads/release')
     needs: [vars, build, deploy_stage]
     with:
