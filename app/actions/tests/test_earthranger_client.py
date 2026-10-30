@@ -3,7 +3,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.actions.buoy.client import BuoyClient
+from app.actions.buoy.client import (
+    MAX_MFR_DEVICE_IDS_PER_REQUEST,
+    BuoyClient,
+    GearFilterNotSupportedError,
+)
 from app.actions.buoy.types import BuoyGear
 
 logger = logging.getLogger(__name__)
@@ -514,3 +518,104 @@ class TestBuoyClient:
         assert "Error parsing gear item:" in str(exc_info.value)
         # Verify that the invalid item data is included in the error message
         assert "invalid-uuid" in str(exc_info.value)
+
+    @staticmethod
+    def _mock_gear_session(mocker, response_data):
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value=response_data)
+        mock_session = MockSession(MockGetContext(mock_response))
+        mocker.patch("aiohttp.ClientSession").return_value = MockSessionContext(
+            mock_session
+        )
+        return mock_session
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_sends_mfr_device_ids_as_repeated_params(
+        self, mocker, sample_buoy_gear_data
+    ):
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_session = self._mock_gear_session(
+            mocker, {"data": {"results": [sample_buoy_gear_data], "next": None}}
+        )
+
+        result = await client.get_er_gears(
+            params={"page_size": 100},
+            state="hauled",
+            mfr_device_ids={"dev_b", "dev_a"},
+        )
+
+        assert len(result) == 1
+        assert len(mock_session.get_calls) == 1
+        _, kwargs = mock_session.get_calls[0]
+        assert kwargs["params"] == [
+            ("page_size", 100),
+            ("include_empty_location", "true"),
+            ("state", "hauled"),
+            ("mfr_device_id", "dev_a"),
+            ("mfr_device_id", "dev_b"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_chunks_mfr_device_ids_and_dedupes_gears(
+        self, mocker, sample_buoy_gear_data
+    ):
+        """A gear matching ids in two chunks is returned once."""
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_session = self._mock_gear_session(
+            mocker, {"data": {"results": [sample_buoy_gear_data], "next": None}}
+        )
+        device_ids = [f"dev_{i:03d}" for i in range(MAX_MFR_DEVICE_IDS_PER_REQUEST + 1)]
+
+        result = await client.get_er_gears(state="hauled", mfr_device_ids=device_ids)
+
+        assert len(result) == 1
+        assert len(mock_session.get_calls) == 2
+        sent_ids = [
+            [value for key, value in kwargs["params"] if key == "mfr_device_id"]
+            for _, kwargs in mock_session.get_calls
+        ]
+        assert [len(ids) for ids in sent_ids] == [MAX_MFR_DEVICE_IDS_PER_REQUEST, 1]
+        assert sent_ids[0] + sent_ids[1] == device_ids
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_with_no_mfr_device_ids_skips_the_request(self, mocker):
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_client_session = mocker.patch("aiohttp.ClientSession")
+
+        result = await client.get_er_gears(state="hauled", mfr_device_ids=[])
+
+        assert result == []
+        mock_client_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_raises_filter_not_supported_on_older_servers(
+        self, mocker
+    ):
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_response = AsyncMock()
+        mock_response.status = 400
+        mock_response.text = AsyncMock(
+            return_value='{"mfr_device_id": ["Unknown parameter"]}'
+        )
+        mocker.patch("aiohttp.ClientSession").return_value = MockSessionContext(
+            MockSession(MockGetContext(mock_response))
+        )
+
+        with pytest.raises(GearFilterNotSupportedError):
+            await client.get_er_gears(state="hauled", mfr_device_ids=["dev_a"])
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_other_bad_requests_are_not_filter_errors(self, mocker):
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_response = AsyncMock()
+        mock_response.status = 400
+        mock_response.text = AsyncMock(return_value='{"state": ["Invalid choice"]}')
+        mocker.patch("aiohttp.ClientSession").return_value = MockSessionContext(
+            MockSession(MockGetContext(mock_response))
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears(state="bogus")
+
+        assert not isinstance(exc_info.value, GearFilterNotSupportedError)

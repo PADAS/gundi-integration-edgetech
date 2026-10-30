@@ -1,3 +1,3 @@
-from .client import BuoyClient
+from .client import BuoyClient, GearFilterNotSupportedError
 
-__all__ = ["BuoyClient"]
+__all__ = ["BuoyClient", "GearFilterNotSupportedError"]
