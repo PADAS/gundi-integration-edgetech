@@ -444,9 +444,29 @@ When processing EdgeTech buoys, the system must determine whether to create a ne
 
 **Step 1: Fetch Existing ER Gears**
 ```python
-er_gears = await er_client.get_er_gears()  # GET /api/v1.0/gear/
+# Every deployed gear: GET /api/v1.0/gear/?state=deployed
+deployed_gears = await er_client.get_er_gears(state="deployed")
+
+# Hauled gear only for deploy candidates — buoys EdgeTech reports as deployed
+# whose devices are on no deployed ER gear:
+# GET /api/v1.0/gear/?state=hauled&mfr_device_id=...&mfr_device_id=...
+hauled_gears = await er_client.get_er_gears(
+    state="hauled", mfr_device_ids=deploy_candidate_device_ids
+)
+er_gears = deployed_gears + hauled_gears
 # Filter: manufacturer.lower() == "edgetech"
 ```
+
+The full hauled history is never listed: it grows without bound, and hauled gear
+only matters for buoys about to be deployed (for source UUID reuse and for a
+two-unit line's end unit that is outside the sync window). Every other decision
+is made against deployed gear. When there are no deploy candidates, the hauled
+lookup is skipped. Candidate device ids cover the no-suffix, `_A` and `_B` name
+formats, plus a two-unit line's end unit, and are sent 100 per request.
+
+If the ER site predates the `mfr_device_id` filter (it answers 400 "Unknown
+parameter"), the processor logs a warning and falls back to fetching all hauled
+gear.
 
 **Step 2: Build Device ID Mapping**
 ```python
@@ -517,7 +537,6 @@ Case 2 - Found in ER with id="abc-123-def":
 For device-level tracking, the system maintains a mapping from manufacturer device IDs to ER source IDs. The map is derived from the gear-fetch response (each device on each gear carries both `mfr_device_id` and `device_id`), so no separate `/sources/` call is needed:
 
 ```python
-er_gears = await er_client.get_er_gears()  # GET /api/v1.0/gear/
 manufacturer_id_to_source_id = {
     device.mfr_device_id: device.device_id
     for gear in er_gears
@@ -525,7 +544,7 @@ manufacturer_id_to_source_id = {
 }
 ```
 
-This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones. Sources that are not attached to any gear (orphans from a failed deploy) will not appear in the map; the next deploy for that `mfr_device_id` will mint a new source UUID.
+This ensures that when updating existing gear sets, the correct source IDs are preserved rather than generating new ones. A device missing from the map (an orphan source from a failed deploy, or a hauled device that wasn't looked up) is sent with a new UUID; the Buoy API then reuses an existing source with the same `mfr_device_id` under the `edgetech` provider, or creates one. A source created under another provider (some buoy.pamdas.org sources predate the `edgetech` provider and sit under `default`) is not matched, so a new UUID for such a device creates a duplicate source.
 
 ---
 
@@ -1023,7 +1042,9 @@ Result: Entire system skipped if either unit missing
                  ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. FETCH EARTH RANGER GEARS                                 │
-│    - GET /api/v1.0/gear/                                    │
+│    - GET /api/v1.0/gear/?state=deployed (all)               │
+│    - GET /api/v1.0/gear/?state=hauled&mfr_device_id=...     │
+│      (deploy candidates only; skipped when there are none)  │
 │    - Filter manufacturer = "edgetech"                       │
 │    - Map by device_id                                       │
 └────────────────┬────────────────────────────────────────────┘

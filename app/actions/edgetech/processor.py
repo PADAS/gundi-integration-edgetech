@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
-from app.actions.buoy import BuoyClient
+from app.actions.buoy import BuoyClient, GearFilterNotSupportedError
 from app.actions.buoy.types import BuoyDevice, BuoyGear
 from app.actions.edgetech.types import Buoy
 from app.actions.utils import get_hashed_user_id
@@ -952,6 +952,71 @@ class EdgeTechProcessor:
             )
         return skip_keys
 
+    def _deploy_candidate_device_ids(
+        self,
+        serial_number_to_edgetech_buoy: Dict[str, Buoy],
+        deployed_gears: List[BuoyGear],
+    ) -> Set[str]:
+        """
+        Return the ER device ids worth looking up on hauled gear.
+
+        Only buoys that EdgeTech reports as deployed and that match no deployed
+        ER gear can be affected by hauled gear: _identify_buoys routes them to
+        deploy whether or not hauled gear exists, and the deploy then reads the
+        hauled gear for source UUIDs and, for two-unit lines whose end unit is
+        outside the sync window, the end unit's device. Every other buoy is
+        decided against deployed gear alone.
+
+        Covers each name format a buoy may have been deployed under (no suffix,
+        `_A`, `_B`) and, for two-unit lines, the end unit's device id.
+        """
+        deployed_device_ids = {
+            device.mfr_device_id for gear in deployed_gears for device in gear.devices
+        }
+        device_ids: Set[str] = set()
+        for serial_number_user_id, buoy in serial_number_to_edgetech_buoy.items():
+            if buoy.currentState.isDeleted or not buoy.currentState.isDeployed:
+                continue
+            serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
+            standard_name = f"{serial_number}_{hashed_user_id}"
+            names = {standard_name, f"{standard_name}_A", f"{standard_name}_B"}
+            if names & deployed_device_ids:
+                continue
+            device_ids.update(names)
+            if buoy.currentState.isTwoUnitLine and buoy.currentState.endUnit:
+                device_ids.add(f"{buoy.currentState.endUnit}_{hashed_user_id}")
+        return device_ids
+
+    async def _fetch_hauled_gears_for_deploy_candidates(
+        self,
+        serial_number_to_edgetech_buoy: Dict[str, Buoy],
+        deployed_gears: List[BuoyGear],
+    ) -> List[BuoyGear]:
+        device_ids = self._deploy_candidate_device_ids(
+            serial_number_to_edgetech_buoy, deployed_gears
+        )
+        if not device_ids:
+            logger.info("No deploy candidates; skipping hauled gear lookup")
+            return []
+
+        logger.info(
+            f"Looking up hauled gears for {len(device_ids)} deploy-candidate device ids"
+        )
+        try:
+            return await self._er_client.get_er_gears(
+                params={"page_size": 10000},
+                state="hauled",
+                mfr_device_ids=device_ids,
+            )
+        except GearFilterNotSupportedError:
+            logger.warning(
+                "EarthRanger site does not support the mfr_device_id gear filter; "
+                "falling back to fetching all hauled gears"
+            )
+            return await self._er_client.get_er_gears(
+                params={"page_size": 10000}, state="hauled"
+            )
+
     async def process(self) -> List[Dict[str, Any]]:
         """
         Process buoy data to generate gear payloads for the Buoy API.
@@ -962,8 +1027,9 @@ class EdgeTechProcessor:
 
         Processing steps:
             1. Retrieves and filters the latest buoy states grouped by serial number.
-            2. Fetches existing ER gears and creates mappings for efficient lookups.
-            3. Fetches all sources once for manufacturer ID to source ID mapping.
+            2. Fetches deployed ER gears, plus hauled ER gears for deploy candidates
+               only, and creates mappings for efficient lookups.
+            3. Derives the manufacturer ID to source ID mapping from those gears.
             4. Categorizes buoys based on explicit status checks:
                 - Deploy: Buoys marked as deployed in EdgeTech but not yet in ER, or re-deployments.
                 - Update: Buoys in ER with location changes or newer data from EdgeTech.
@@ -1002,17 +1068,17 @@ class EdgeTechProcessor:
             serial_number_to_edgetech_buoy
         )
 
-        # Fetch all existing gears from ER to compare against EdgeTech data.
-        # The /gear/ endpoint defaults to state=deployed, so hauled gears must
-        # be requested explicitly — we need them both for the source-ID map
-        # (re-deployments reuse source UUIDs that live on the previously-hauled
-        # gear) and for the hauled-vs-deployed dedup below (line ~908).
-        logger.info("Fetching all gears from EarthRanger (deployed + hauled)...")
+        # Fetch every deployed gear from ER to compare against EdgeTech data.
+        # Hauled gears are only fetched for deploy candidates (see
+        # _fetch_hauled_gears_for_deploy_candidates): every other decision is
+        # made against deployed gear, and the full hauled history grows without
+        # bound.
+        logger.info("Fetching deployed gears from EarthRanger...")
         deployed_gears = await self._er_client.get_er_gears(
             params={"page_size": 10000}, state="deployed"
         )
-        hauled_gears = await self._er_client.get_er_gears(
-            params={"page_size": 10000}, state="hauled"
+        hauled_gears = await self._fetch_hauled_gears_for_deploy_candidates(
+            serial_number_to_edgetech_buoy, deployed_gears
         )
         er_gears = deployed_gears + hauled_gears
         logger.info(
@@ -1020,11 +1086,13 @@ class EdgeTechProcessor:
             f"hauled gears from EarthRanger"
         )
 
-        # Build mfr_device_id → source UUID map from gear devices across both
-        # states. Avoids a separate /sources/ call that would require extra
+        # Build mfr_device_id → source UUID map from the fetched gear devices.
+        # Avoids a separate /sources/ call that would require extra
         # permissions. If the same mfr_device_id appears on multiple gears
         # (e.g. hauled-then-redeployed), every occurrence maps to the same
-        # underlying source UUID, so dict overwrite is fine.
+        # underlying source UUID, so dict overwrite is fine. A device missing
+        # from the map gets a fresh UUID; the Buoy API reuses an existing
+        # source only if it is under the same provider (edgetech).
         manufacturer_id_to_source_id = {
             device.mfr_device_id: device.device_id
             for gear in er_gears

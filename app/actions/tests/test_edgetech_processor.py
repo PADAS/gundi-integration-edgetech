@@ -6,6 +6,7 @@ from uuid import uuid4
 import pydantic
 import pytest
 
+from app.actions.buoy import GearFilterNotSupportedError
 from app.actions.buoy.types import BuoyDevice, BuoyGear, DeviceLocation
 from app.actions.edgetech.processor import EdgeTechProcessor
 from app.actions.edgetech.types import Buoy
@@ -30,8 +31,19 @@ async def test_process_new_edgetech_trawl(mocker, a_new_edgetech_trawl_record):
     # Act & Assert - The process should complete without errors
     await processor.process()
 
-    # Verify that the ER client was called
+    # Deployed gear is fetched in full; hauled gear only for this new buoy's devices
     assert mock_er_client.get_er_gears.call_count == 2
+    hauled_call = mock_er_client.get_er_gears.await_args_list[1]
+    assert hauled_call.kwargs["state"] == "hauled"
+    standard_name = (
+        f"{a_new_edgetech_trawl_record['serialNumber']}_"
+        f"{get_hashed_user_id(a_new_edgetech_trawl_record['userId'])}"
+    )
+    assert hauled_call.kwargs["mfr_device_ids"] == {
+        standard_name,
+        f"{standard_name}_A",
+        f"{standard_name}_B",
+    }
 
 
 @pytest.fixture
@@ -839,8 +851,10 @@ class TestEdgeTechProcessor:
         # Act
         await processor.process()
 
-        # Verify that the ER client was called
-        assert mock_er_client.get_er_gears.call_count == 2
+        # The buoy is on deployed gear, so no hauled lookup is needed
+        mock_er_client.get_er_gears.assert_awaited_once_with(
+            params={"page_size": 10000}, state="deployed"
+        )
 
     @pytest.mark.asyncio
     async def test_process_creates_haul_observations(self, mocker):
@@ -875,8 +889,10 @@ class TestEdgeTechProcessor:
         # Act
         await processor.process()
 
-        # Verify that the ER client was called
-        assert mock_er_client.get_er_gears.call_count == 2
+        # No buoy in the sync window, so there are no deploy candidates to look up
+        mock_er_client.get_er_gears.assert_awaited_once_with(
+            params={"page_size": 10000}, state="deployed"
+        )
 
     @pytest.mark.asyncio
     async def test_process_haul_targets_deployed_gear_not_stale_hauled(
@@ -3133,3 +3149,166 @@ class TestEdgeTechProcessor:
         )
         assert lat == 42.4992445
         assert lon == -70.8112983
+
+    @staticmethod
+    def _gear(status, devices, last_updated=None):
+        return BuoyGear(
+            id=uuid4(),
+            display_id=f"GEAR-{status}",
+            status=status,
+            last_updated=last_updated or datetime.now(timezone.utc),
+            devices=[
+                BuoyDevice(
+                    device_id=device_id,
+                    mfr_device_id=mfr_device_id,
+                    label=mfr_device_id,
+                    location=DeviceLocation(latitude=44.0, longitude=-68.0),
+                    last_updated=datetime.now(timezone.utc) - timedelta(days=2),
+                    last_deployed=datetime.now(timezone.utc) - timedelta(days=3),
+                )
+                for device_id, mfr_device_id in devices
+            ],
+            type="trawl" if len(devices) > 1 else "single",
+            manufacturer="edgetech",
+        )
+
+    def test_deploy_candidate_device_ids_only_covers_deployed_buoys_missing_from_deployed_gear(
+        self, a_new_edgetech_trawl_record
+    ):
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        new_buoy = Buoy.parse_obj(a_new_edgetech_trawl_record)
+        already_deployed = Buoy.parse_obj(
+            {**a_new_edgetech_trawl_record, "serialNumber": "ONDEPLOYED"}
+        )
+        not_deployed = Buoy.parse_obj(
+            {
+                **a_new_edgetech_trawl_record,
+                "serialNumber": "NOTDEPLOYED",
+                "currentState": {
+                    **a_new_edgetech_trawl_record["currentState"],
+                    "isDeployed": False,
+                },
+            }
+        )
+        deleted = Buoy.parse_obj(
+            {
+                **a_new_edgetech_trawl_record,
+                "serialNumber": "DELETED",
+                "currentState": {
+                    **a_new_edgetech_trawl_record["currentState"],
+                    "isDeleted": True,
+                },
+            }
+        )
+        serial_number_to_edgetech_buoy = {
+            f"{buoy.serialNumber}/{hashed_user_id}": buoy
+            for buoy in (new_buoy, already_deployed, not_deployed, deleted)
+        }
+        # Deployed under the `_B` suffix only — any name format counts as a match
+        deployed_gears = [
+            self._gear("deployed", [("uuid-1", f"ONDEPLOYED_{hashed_user_id}_B")])
+        ]
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        device_ids = processor._deploy_candidate_device_ids(
+            serial_number_to_edgetech_buoy, deployed_gears
+        )
+
+        standard_name = f"{new_buoy.serialNumber}_{hashed_user_id}"
+        assert device_ids == {
+            standard_name,
+            f"{standard_name}_A",
+            f"{standard_name}_B",
+        }
+
+    def test_deploy_candidate_device_ids_include_two_unit_end_unit(
+        self, a_new_edgetech_trawl_record
+    ):
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        start_unit = Buoy.parse_obj(
+            {
+                **a_new_edgetech_trawl_record,
+                "currentState": {
+                    **a_new_edgetech_trawl_record["currentState"],
+                    "isTwoUnitLine": True,
+                    "endUnit": "ENDUNIT01",
+                },
+            }
+        )
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        device_ids = processor._deploy_candidate_device_ids(
+            {f"{start_unit.serialNumber}/{hashed_user_id}": start_unit}, []
+        )
+
+        assert f"ENDUNIT01_{hashed_user_id}" in device_ids
+
+    @pytest.mark.asyncio
+    async def test_process_recovery_deploy_reuses_source_ids_from_targeted_hauled_lookup(
+        self, a_new_edgetech_trawl_record
+    ):
+        """A buoy hauled in ER and deployed again in EdgeTech is found via the
+        targeted hauled lookup, and its deploy reuses the hauled gear's source
+        UUIDs."""
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        standard_name = (
+            f"{a_new_edgetech_trawl_record['serialNumber']}_{hashed_user_id}"
+        )
+        hauled_gear = self._gear(
+            "hauled",
+            [
+                ("source-uuid-a", f"{standard_name}_A"),
+                ("source-uuid-b", f"{standard_name}_B"),
+            ],
+        )
+
+        async def fake_get_er_gears(params=None, state=None, mfr_device_ids=None):
+            if state == "deployed":
+                return []
+            assert mfr_device_ids, "hauled gear must only be fetched by device id"
+            return [hauled_gear]
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="token", er_url="url"
+        )
+        processor._er_client = Mock()
+        processor._er_client.get_er_gears = AsyncMock(side_effect=fake_get_er_gears)
+
+        gear_payloads = await processor.process()
+
+        deploy_payloads = [p for p in gear_payloads if "initial_deployment_date" in p]
+        assert len(deploy_payloads) == 1
+        device_ids = {
+            d["mfr_device_id"]: d["device_id"] for d in deploy_payloads[0]["devices"]
+        }
+        assert device_ids == {
+            f"{standard_name}_A": "source-uuid-a",
+            f"{standard_name}_B": "source-uuid-b",
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_falls_back_to_full_hauled_fetch_when_filter_unsupported(
+        self, caplog, a_new_edgetech_trawl_record
+    ):
+        """Against an ER site that predates the mfr_device_id filter, the
+        processor fetches all hauled gear, as it did before the filter existed."""
+        calls = []
+
+        async def fake_get_er_gears(params=None, state=None, mfr_device_ids=None):
+            calls.append((state, mfr_device_ids))
+            if mfr_device_ids is not None:
+                raise GearFilterNotSupportedError("unknown parameter")
+            return []
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="token", er_url="url"
+        )
+        processor._er_client = Mock()
+        processor._er_client.get_er_gears = AsyncMock(side_effect=fake_get_er_gears)
+
+        with caplog.at_level(logging.WARNING):
+            await processor.process()
+
+        assert [state for state, _ in calls] == ["deployed", "hauled", "hauled"]
+        assert calls[-1] == ("hauled", None)
+        assert "falling back to fetching all hauled gears" in caplog.text
