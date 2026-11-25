@@ -39,6 +39,7 @@ async def test_process_new_edgetech_trawl(mocker, a_new_edgetech_trawl_record):
         f"{a_new_edgetech_trawl_record['serialNumber']}_"
         f"{get_hashed_user_id(a_new_edgetech_trawl_record['userId'])}"
     )
+    assert hauled_call.kwargs["manufacturer"] == "EdgeTech"
     assert hauled_call.kwargs["mfr_device_ids"] == {
         standard_name,
         f"{standard_name}_A",
@@ -822,8 +823,14 @@ class TestEdgeTechProcessor:
         data = [a_new_edgetech_trawl_record]
         processor = EdgeTechProcessor(data=data, er_token="token", er_url="url")
 
-        # Create existing ER gear with older timestamp
+        # Create existing ER gear with older timestamp, from the same deployment
+        # (a later EdgeTech dateDeployed would make this a re-deployment)
         older_time = datetime(2025, 5, 20, 10, 0, 0, tzinfo=timezone.utc)
+        same_deployment = datetime.fromisoformat(
+            a_new_edgetech_trawl_record["currentState"]["dateDeployed"].replace(
+                "Z", "+00:00"
+            )
+        )
 
         mock_device = BuoyDevice(
             device_id="8899CEDAAA_n9JpP3kk8vFVyNlzMnYZig9DnO475ztWV5JQ4z3RHwO19GPjN9sL8qDw8YgW_A",
@@ -831,7 +838,7 @@ class TestEdgeTechProcessor:
             label="Test Device",
             location=DeviceLocation(latitude=44.0, longitude=-68.0),
             last_updated=older_time,
-            last_deployed=older_time,
+            last_deployed=same_deployment,
         )
 
         mock_gear = BuoyGear(
@@ -3151,7 +3158,7 @@ class TestEdgeTechProcessor:
         assert lon == -70.8112983
 
     @staticmethod
-    def _gear(status, devices, last_updated=None):
+    def _gear(status, devices, last_updated=None, last_deployed=None):
         return BuoyGear(
             id=uuid4(),
             display_id=f"GEAR-{status}",
@@ -3164,7 +3171,8 @@ class TestEdgeTechProcessor:
                     label=mfr_device_id,
                     location=DeviceLocation(latitude=44.0, longitude=-68.0),
                     last_updated=datetime.now(timezone.utc) - timedelta(days=2),
-                    last_deployed=datetime.now(timezone.utc) - timedelta(days=3),
+                    last_deployed=last_deployed
+                    or datetime.now(timezone.utc) - timedelta(days=3),
                 )
                 for device_id, mfr_device_id in devices
             ],
@@ -3243,6 +3251,28 @@ class TestEdgeTechProcessor:
 
         assert f"ENDUNIT01_{hashed_user_id}" in device_ids
 
+    def test_deploy_candidate_device_ids_for_redeployment_skip_ids_on_deployed_gear(
+        self, a_new_edgetech_trawl_record
+    ):
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        buoy = Buoy.parse_obj(a_new_edgetech_trawl_record)
+        standard_name = f"{buoy.serialNumber}_{hashed_user_id}"
+        # Deployed before EdgeTech's dateDeployed, so this is a re-deployment
+        deployed_gears = [
+            self._gear(
+                "deployed",
+                [("uuid-a", f"{standard_name}_A"), ("uuid-b", f"{standard_name}_B")],
+                last_deployed=datetime(2025, 5, 1, tzinfo=timezone.utc),
+            )
+        ]
+        processor = EdgeTechProcessor(data=[], er_token="token", er_url="url")
+
+        device_ids = processor._deploy_candidate_device_ids(
+            {f"{buoy.serialNumber}/{hashed_user_id}": buoy}, deployed_gears
+        )
+
+        assert device_ids == {standard_name}
+
     @pytest.mark.asyncio
     async def test_process_recovery_deploy_reuses_source_ids_from_targeted_hauled_lookup(
         self, a_new_edgetech_trawl_record
@@ -3262,7 +3292,9 @@ class TestEdgeTechProcessor:
             ],
         )
 
-        async def fake_get_er_gears(params=None, state=None, mfr_device_ids=None):
+        async def fake_get_er_gears(
+            params=None, state=None, mfr_device_ids=None, manufacturer=None
+        ):
             if state == "deployed":
                 return []
             assert mfr_device_ids, "hauled gear must only be fetched by device id"
@@ -3294,8 +3326,10 @@ class TestEdgeTechProcessor:
         processor fetches all hauled gear, as it did before the filter existed."""
         calls = []
 
-        async def fake_get_er_gears(params=None, state=None, mfr_device_ids=None):
-            calls.append((state, mfr_device_ids))
+        async def fake_get_er_gears(
+            params=None, state=None, mfr_device_ids=None, manufacturer=None
+        ):
+            calls.append((state, mfr_device_ids, manufacturer))
             if mfr_device_ids is not None:
                 raise GearFilterNotSupportedError("unknown parameter")
             return []
@@ -3309,6 +3343,141 @@ class TestEdgeTechProcessor:
         with caplog.at_level(logging.WARNING):
             await processor.process()
 
-        assert [state for state, _ in calls] == ["deployed", "hauled", "hauled"]
-        assert calls[-1] == ("hauled", None)
+        assert [state for state, _, _ in calls] == ["deployed", "hauled", "hauled"]
+        assert calls[1][2] == "EdgeTech"
+        assert calls[-1] == ("hauled", None, None)
         assert "falling back to fetching all hauled gears" in caplog.text
+
+    @staticmethod
+    def _fake_buoy_api(deployed_gears, hauled_gears):
+        """Answer get_er_gears like the Buoy API: hauled gear is returned only
+        when it carries one of the requested mfr_device_ids."""
+
+        async def fake_get_er_gears(
+            params=None, state=None, mfr_device_ids=None, manufacturer=None
+        ):
+            if state == "deployed":
+                return deployed_gears
+            assert mfr_device_ids, "hauled gear must only be fetched by device id"
+            return [
+                gear
+                for gear in hauled_gears
+                if {d.mfr_device_id for d in gear.devices} & set(mfr_device_ids)
+            ]
+
+        return AsyncMock(side_effect=fake_get_er_gears)
+
+    @pytest.mark.asyncio
+    async def test_process_redeploy_from_two_unit_line_to_single_unit_reuses_source_ids(
+        self, a_new_edgetech_trawl_record
+    ):
+        """A buoy deployed as a two-unit line (no suffix) and re-deployed as a
+        single unit with end coordinates (`_A`/`_B`) reuses the source UUIDs of
+        the `_A`/`_B` devices from its earlier, hauled single-unit deployment."""
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        standard_name = (
+            f"{a_new_edgetech_trawl_record['serialNumber']}_{hashed_user_id}"
+        )
+        before_redeploy = datetime(2025, 5, 1, tzinfo=timezone.utc)
+        hauled_single_unit = self._gear(
+            "hauled",
+            [
+                ("source-uuid-a", f"{standard_name}_A"),
+                ("source-uuid-b", f"{standard_name}_B"),
+            ],
+            last_deployed=before_redeploy - timedelta(days=30),
+        )
+        deployed_two_unit = self._gear(
+            "deployed",
+            [
+                ("source-uuid-start", standard_name),
+                ("source-uuid-end", f"ENDUNIT01_{hashed_user_id}"),
+            ],
+            last_deployed=before_redeploy,
+        )
+
+        processor = EdgeTechProcessor(
+            data=[a_new_edgetech_trawl_record], er_token="token", er_url="url"
+        )
+        processor._er_client = Mock()
+        processor._er_client.get_er_gears = self._fake_buoy_api(
+            [deployed_two_unit], [hauled_single_unit]
+        )
+
+        gear_payloads = await processor.process()
+
+        deploy_payloads = [p for p in gear_payloads if "initial_deployment_date" in p]
+        assert len(deploy_payloads) == 1
+        device_ids = {
+            d["mfr_device_id"]: d["device_id"] for d in deploy_payloads[0]["devices"]
+        }
+        assert device_ids == {
+            f"{standard_name}_A": "source-uuid-a",
+            f"{standard_name}_B": "source-uuid-b",
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_redeploy_from_single_unit_to_two_unit_line_reuses_source_ids(
+        self, a_new_edgetech_trawl_record
+    ):
+        """A buoy deployed as a single unit (`_A`/`_B`) and re-deployed as the
+        start of a two-unit line (no suffix) reuses the source UUID of the
+        no-suffix device from its earlier, hauled two-unit deployment."""
+        hashed_user_id = get_hashed_user_id(a_new_edgetech_trawl_record["userId"])
+        serial_number = a_new_edgetech_trawl_record["serialNumber"]
+        standard_name = f"{serial_number}_{hashed_user_id}"
+        before_redeploy = datetime(2025, 5, 1, tzinfo=timezone.utc)
+        hauled_two_unit = self._gear(
+            "hauled",
+            [
+                ("source-uuid-start", standard_name),
+                ("source-uuid-old-end", f"OLDEND01_{hashed_user_id}"),
+            ],
+            last_deployed=before_redeploy - timedelta(days=30),
+        )
+        deployed_single_unit = self._gear(
+            "deployed",
+            [
+                ("source-uuid-a", f"{standard_name}_A"),
+                ("source-uuid-b", f"{standard_name}_B"),
+            ],
+            last_deployed=before_redeploy,
+        )
+        start_state = {
+            **a_new_edgetech_trawl_record["currentState"],
+            "endLatDeg": None,
+            "endLonDeg": None,
+            "isTwoUnitLine": True,
+            "endUnit": "NEWEND01",
+        }
+        start_record = {**a_new_edgetech_trawl_record, "currentState": start_state}
+        end_record = {
+            **a_new_edgetech_trawl_record,
+            "serialNumber": "NEWEND01",
+            "currentState": {
+                **start_state,
+                "serialNumber": "NEWEND01",
+                "latDeg": 44.3591792,
+                "lonDeg": -68.167191,
+                "endUnit": None,
+                "startUnit": serial_number,
+            },
+        }
+
+        processor = EdgeTechProcessor(
+            data=[start_record, end_record], er_token="token", er_url="url"
+        )
+        processor._er_client = Mock()
+        processor._er_client.get_er_gears = self._fake_buoy_api(
+            [deployed_single_unit], [hauled_two_unit]
+        )
+
+        gear_payloads = await processor.process()
+
+        deploy_payloads = [p for p in gear_payloads if "initial_deployment_date" in p]
+        assert len(deploy_payloads) == 1
+        device_ids = {
+            d["mfr_device_id"]: d["device_id"] for d in deploy_payloads[0]["devices"]
+        }
+        assert device_ids[standard_name] == "source-uuid-start"
+        assert set(device_ids) == {standard_name, f"NEWEND01_{hashed_user_id}"}

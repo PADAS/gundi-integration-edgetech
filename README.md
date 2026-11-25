@@ -448,13 +448,16 @@ When processing EdgeTech buoys, the system must determine whether to create a ne
 deployed_gears = await er_client.get_er_gears(state="deployed")
 
 # Hauled gear only for deploy candidates — buoys EdgeTech reports as deployed
-# whose devices are on no deployed ER gear:
-# GET /api/v1.0/gear/?state=hauled&mfr_device_id=...&mfr_device_id=...
+# whose devices are on no deployed ER gear, or that re-deploy the deployed gear
+# they are on:
+# GET /api/v1.0/gear/?state=hauled&manufacturer=EdgeTech&mfr_device_id=...&mfr_device_id=...
 hauled_gears = await er_client.get_er_gears(
-    state="hauled", mfr_device_ids=deploy_candidate_device_ids
+    state="hauled",
+    mfr_device_ids=deploy_candidate_device_ids,
+    manufacturer="EdgeTech",
 )
 er_gears = deployed_gears + hauled_gears
-# Filter: manufacturer.lower() == "edgetech"
+# Filter: manufacturer.lower() == "edgetech" (kept as a safety net)
 ```
 
 The full hauled history is never listed: it grows without bound, and hauled gear
@@ -462,11 +465,16 @@ only matters for buoys about to be deployed (for source UUID reuse and for a
 two-unit line's end unit that is outside the sync window). Every other decision
 is made against deployed gear. When there are no deploy candidates, the hauled
 lookup is skipped. Candidate device ids cover the no-suffix, `_A` and `_B` name
-formats, plus a two-unit line's end unit, and are sent 100 per request.
+formats, plus a two-unit line's end unit, and are sent 100 per request. A
+re-deployment can switch format (two-unit line to single unit with end
+coordinates, or the reverse), so its new device ids may exist only on older
+hauled gear; for a re-deployment only the ids not already on deployed gear are
+looked up. Device ids are unique only per manufacturer, so the lookup also
+sends `manufacturer=EdgeTech`.
 
-If the ER site predates the `mfr_device_id` filter (it answers 400 "Unknown
-parameter"), the processor logs a warning and falls back to fetching all hauled
-gear.
+If the ER site predates these filters (it answers 400 "Unknown parameter" for
+`mfr_device_id`, `manufacturer`, or both), the processor logs a warning and
+falls back to fetching all hauled gear.
 
 **Step 2: Build Device ID Mapping**
 ```python
@@ -1043,7 +1051,8 @@ Result: Entire system skipped if either unit missing
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. FETCH EARTH RANGER GEARS                                 │
 │    - GET /api/v1.0/gear/?state=deployed (all)               │
-│    - GET /api/v1.0/gear/?state=hauled&mfr_device_id=...     │
+│    - GET /api/v1.0/gear/?state=hauled&manufacturer=EdgeTech │
+│      &mfr_device_id=...                                     │
 │      (deploy candidates only; skipped when there are none)  │
 │    - Filter manufacturer = "edgetech"                       │
 │    - Map by device_id                                       │

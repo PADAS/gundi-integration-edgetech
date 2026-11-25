@@ -12,9 +12,31 @@ logger = logging.getLogger(__name__)
 # Matches the server's cap on repeated `mfr_device_id` values per request.
 MAX_MFR_DEVICE_IDS_PER_REQUEST = 100
 
+# Gear filter query parameters that older ER sites reject as unknown.
+GEAR_FILTER_PARAMS = ("mfr_device_id", "manufacturer")
+
 
 class GearFilterNotSupportedError(RuntimeError):
-    """The ER site does not recognise the `mfr_device_id` gear filter."""
+    """The ER site does not recognise the `mfr_device_id` / `manufacturer` gear filters."""
+
+
+def _rejects_gear_filter_as_unknown(body: str) -> bool:
+    """Whether a 400 body names a gear filter parameter as unknown, e.g.
+    `{"manufacturer": "Unknown parameter"}` or `{"mfr_device_id": ["Unknown parameter"]}`.
+    """
+    try:
+        errors = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(errors, dict):
+        return False
+    for param in GEAR_FILTER_PARAMS:
+        messages = errors.get(param)
+        if isinstance(messages, str):
+            messages = [messages]
+        if isinstance(messages, list) and "Unknown parameter" in messages:
+            return True
+    return False
 
 
 class BuoyClient:
@@ -30,6 +52,7 @@ class BuoyClient:
         params: Optional[dict] = None,
         state: Optional[str] = None,
         mfr_device_ids: Optional[Iterable[str]] = None,
+        manufacturer: Optional[str] = None,
     ) -> List[BuoyGear]:
         """Fetch gears from the Buoy API.
 
@@ -46,16 +69,22 @@ class BuoyClient:
                 `mfr_device_id` parameters in chunks of
                 MAX_MFR_DEVICE_IDS_PER_REQUEST. An empty iterable returns []
                 without calling the API.
+            manufacturer: Optional manufacturer name (case-insensitive) sent as
+                the `manufacturer` filter. Device ids are unique only per
+                manufacturer, so send it with `mfr_device_ids`. Gears from other
+                manufacturers are dropped client-side either way.
 
         Raises:
-            GearFilterNotSupportedError: The ER site rejected `mfr_device_id`
-                (it predates the filter).
+            GearFilterNotSupportedError: The ER site rejected `mfr_device_id` or
+                `manufacturer` as unknown (it predates the filter).
             RuntimeError: Any other failed or malformed response.
         """
         base_params = dict(params) if params else {}
         base_params["include_empty_location"] = "true"
         if state:
             base_params["state"] = state
+        if manufacturer:
+            base_params["manufacturer"] = manufacturer
 
         if mfr_device_ids is None:
             query_param_sets: List[Any] = [base_params]
@@ -110,13 +139,9 @@ class BuoyClient:
             ) as response:
                 if response.status != 200:
                     body = await response.text()
-                    if (
-                        response.status == 400
-                        and "mfr_device_id" in body
-                        and "Unknown parameter" in body
-                    ):
+                    if response.status == 400 and _rejects_gear_filter_as_unknown(body):
                         raise GearFilterNotSupportedError(
-                            f"Buoy Gear API rejected the mfr_device_id filter. Body: {body}"
+                            f"Buoy Gear API rejected the gear filters. Body: {body}"
                         )
                     raise RuntimeError(
                         f"Failed to fetch gear from Buoy Gear API. Status code: {response.status} Body: {body}"

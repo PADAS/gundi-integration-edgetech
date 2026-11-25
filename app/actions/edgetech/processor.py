@@ -714,6 +714,33 @@ class EdgeTechProcessor:
 
         return list(latest.values())
 
+    @staticmethod
+    def _er_gear_deployment_date(er_gear: BuoyGear) -> Optional[datetime]:
+        er_gear_deployment_dates = [
+            d.last_deployed
+            for d in er_gear.devices
+            if isinstance(getattr(d, "last_deployed", None), datetime)
+        ]
+        return min(er_gear_deployment_dates) if er_gear_deployment_dates else None
+
+    @classmethod
+    def _is_redeployment(cls, er_gear: BuoyGear, edgetech_buoy: Buoy) -> bool:
+        """
+        Whether a deployed ER gear is being replaced by a new deployment of the
+        same buoy: EdgeTech dateDeployed is meaningfully later than ER's (e.g.
+        same units deployed again). Uses a 1-minute threshold to avoid treating
+        microsecond/timestamp precision differences as re-deploy.
+        """
+        er_gear_deployment_date = cls._er_gear_deployment_date(er_gear)
+        edgetech_date_deployed = edgetech_buoy.currentState.dateDeployed
+        return (
+            er_gear_deployment_date is not None
+            and edgetech_date_deployed is not None
+            and (edgetech_date_deployed - er_gear_deployment_date)
+            > timedelta(minutes=1)
+            and er_gear.status == "deployed"
+        )
+
     async def _identify_buoys(
         self,
         er_gears_devices_id_to_gear: Dict[str, BuoyGear],
@@ -814,34 +841,14 @@ class EdgeTechProcessor:
                 else:
                     # Buoy is still deployed - check for re-deployment first (new deployment
                     # with same serials: close previous gear and create new one)
-                    er_gear_deployment_dates = [
-                        d.last_deployed
-                        for d in er_gear.devices
-                        if isinstance(getattr(d, "last_deployed", None), datetime)
-                    ]
-                    er_gear_deployment_date = (
-                        min(er_gear_deployment_dates)
-                        if er_gear_deployment_dates
-                        else None
-                    )
-                    edgetech_date_deployed = edgetech_buoy.currentState.dateDeployed
-                    # Re-deployment: EdgeTech dateDeployed is meaningfully later than ER's
-                    # (e.g. same units deployed again). Use 1-minute threshold to avoid
-                    # treating microsecond/timestamp precision differences as re-deploy.
-                    is_redeployment = (
-                        er_gear_deployment_date is not None
-                        and edgetech_date_deployed is not None
-                        and (edgetech_date_deployed - er_gear_deployment_date)
-                        > timedelta(minutes=1)
-                        and er_gear.status == "deployed"
-                    )
-                    if is_redeployment:
+                    if self._is_redeployment(er_gear, edgetech_buoy):
                         to_haul.add(serial_number_user_id)
                         to_deploy.add(serial_number_user_id)
                         logger.info(
                             f"Buoy {serial_number_user_id} marked for re-deployment "
-                            f"(EdgeTech dateDeployed={edgetech_date_deployed} > ER gear deployment "
-                            f"{er_gear_deployment_date}); will haul existing gear then deploy new."
+                            f"(EdgeTech dateDeployed={edgetech_buoy.currentState.dateDeployed} "
+                            f"> ER gear deployment {self._er_gear_deployment_date(er_gear)}); "
+                            f"will haul existing gear then deploy new."
                         )
                         continue
 
@@ -960,18 +967,24 @@ class EdgeTechProcessor:
         """
         Return the ER device ids worth looking up on hauled gear.
 
-        Only buoys that EdgeTech reports as deployed and that match no deployed
-        ER gear can be affected by hauled gear: _identify_buoys routes them to
-        deploy whether or not hauled gear exists, and the deploy then reads the
-        hauled gear for source UUIDs and, for two-unit lines whose end unit is
-        outside the sync window, the end unit's device. Every other buoy is
-        decided against deployed gear alone.
+        Only buoys that _identify_buoys routes to deploy can be affected by
+        hauled gear: the deploy reads it for source UUIDs and, for two-unit
+        lines whose end unit is outside the sync window, the end unit's device.
+        Those are buoys EdgeTech reports as deployed that either match no
+        deployed ER gear or are re-deployments of the deployed gear they match.
+        Every other buoy is decided against deployed gear alone.
 
         Covers each name format a buoy may have been deployed under (no suffix,
-        `_A`, `_B`) and, for two-unit lines, the end unit's device id.
+        `_A`, `_B`) and, for two-unit lines, the end unit's device id. A
+        re-deployment can change format (two-unit line <-> single unit with end
+        coordinates), and the new format's ids may then exist only on older
+        hauled gear. Ids already on deployed gear are left out: their source
+        UUIDs are known.
         """
-        deployed_device_ids = {
-            device.mfr_device_id for gear in deployed_gears for device in gear.devices
+        deployed_device_id_to_gear = {
+            device.mfr_device_id: gear
+            for gear in deployed_gears
+            for device in gear.devices
         }
         device_ids: Set[str] = set()
         for serial_number_user_id, buoy in serial_number_to_edgetech_buoy.items():
@@ -980,11 +993,19 @@ class EdgeTechProcessor:
             serial_number, hashed_user_id = serial_number_user_id.split("/", 2)
             standard_name = f"{serial_number}_{hashed_user_id}"
             names = {standard_name, f"{standard_name}_A", f"{standard_name}_B"}
-            if names & deployed_device_ids:
-                continue
-            device_ids.update(names)
             if buoy.currentState.isTwoUnitLine and buoy.currentState.endUnit:
-                device_ids.add(f"{buoy.currentState.endUnit}_{hashed_user_id}")
+                names.add(f"{buoy.currentState.endUnit}_{hashed_user_id}")
+            deployed_gear = self._lookup_er_gear_preferring_deployed(
+                deployed_device_id_to_gear,
+                f"{standard_name}_A",
+                standard_name,
+                f"{standard_name}_B",
+            )
+            if deployed_gear is not None and not self._is_redeployment(
+                deployed_gear, buoy
+            ):
+                continue
+            device_ids.update(names - deployed_device_id_to_gear.keys())
         return device_ids
 
     async def _fetch_hauled_gears_for_deploy_candidates(
@@ -1007,10 +1028,12 @@ class EdgeTechProcessor:
                 params={"page_size": 10000},
                 state="hauled",
                 mfr_device_ids=device_ids,
+                manufacturer="EdgeTech",
             )
         except GearFilterNotSupportedError:
             logger.warning(
-                "EarthRanger site does not support the mfr_device_id gear filter; "
+                "EarthRanger site does not support the mfr_device_id/manufacturer "
+                "gear filters; "
                 "falling back to fetching all hauled gears"
             )
             return await self._er_client.get_er_gears(

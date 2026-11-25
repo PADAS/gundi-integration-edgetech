@@ -589,21 +589,105 @@ class TestBuoyClient:
         mock_client_session.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_get_er_gears_sends_manufacturer_with_mfr_device_ids(
+        self, mocker, sample_buoy_gear_data
+    ):
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_session = self._mock_gear_session(
+            mocker, {"data": {"results": [sample_buoy_gear_data], "next": None}}
+        )
+
+        await client.get_er_gears(
+            state="hauled", mfr_device_ids=["dev_a"], manufacturer="EdgeTech"
+        )
+
+        _, kwargs = mock_session.get_calls[0]
+        assert kwargs["params"] == [
+            ("include_empty_location", "true"),
+            ("state", "hauled"),
+            ("manufacturer", "EdgeTech"),
+            ("mfr_device_id", "dev_a"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_still_filters_manufacturer_client_side(
+        self, mocker, sample_buoy_gear_data
+    ):
+        """The server-side manufacturer filter is backed by the client-side one."""
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        other_manufacturer = {
+            **sample_buoy_gear_data,
+            "id": "11111111-1111-1111-1111-111111111111",
+            "manufacturer": "OtherMaker",
+        }
+        self._mock_gear_session(
+            mocker,
+            {
+                "data": {
+                    "results": [sample_buoy_gear_data, other_manufacturer],
+                    "next": None,
+                }
+            },
+        )
+
+        result = await client.get_er_gears(
+            state="hauled", mfr_device_ids=["dev_a"], manufacturer="EdgeTech"
+        )
+
+        assert [gear.manufacturer.lower() for gear in result] == ["edgetech"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"mfr_device_id": ["Unknown parameter"]}',
+            '{"manufacturer": "Unknown parameter"}',
+            # The full shape an older das sends: DRF lists the messages, and
+            # fixup_api_response adds a sibling status block.
+            '{"manufacturer": ["Unknown parameter"], '
+            '"mfr_device_id": ["Unknown parameter"], '
+            '"status": {"code": 400, "message": "Bad Request"}}',
+        ],
+        ids=["mfr_device_id_only", "manufacturer_only", "both"],
+    )
     async def test_get_er_gears_raises_filter_not_supported_on_older_servers(
-        self, mocker
+        self, mocker, body
     ):
         client = BuoyClient(er_token="test-token", er_site="https://example.com/")
         mock_response = AsyncMock()
         mock_response.status = 400
-        mock_response.text = AsyncMock(
-            return_value='{"mfr_device_id": ["Unknown parameter"]}'
-        )
+        mock_response.text = AsyncMock(return_value=body)
         mocker.patch("aiohttp.ClientSession").return_value = MockSessionContext(
             MockSession(MockGetContext(mock_response))
         )
 
         with pytest.raises(GearFilterNotSupportedError):
-            await client.get_er_gears(state="hauled", mfr_device_ids=["dev_a"])
+            await client.get_er_gears(
+                state="hauled", mfr_device_ids=["dev_a"], manufacturer="EdgeTech"
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_er_gears_other_errors_on_filter_params_are_not_filter_errors(
+        self, mocker
+    ):
+        """A filter parameter the server knows but rejects (e.g. too long) is a
+        plain error, not a reason to fall back."""
+        client = BuoyClient(er_token="test-token", er_site="https://example.com/")
+        mock_response = AsyncMock()
+        mock_response.status = 400
+        mock_response.text = AsyncMock(
+            return_value='{"manufacturer": ["Ensure this field has no more than 100 characters."]}'
+        )
+        mocker.patch("aiohttp.ClientSession").return_value = MockSessionContext(
+            MockSession(MockGetContext(mock_response))
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.get_er_gears(
+                state="hauled", mfr_device_ids=["dev_a"], manufacturer="x" * 101
+            )
+
+        assert not isinstance(exc_info.value, GearFilterNotSupportedError)
 
     @pytest.mark.asyncio
     async def test_get_er_gears_other_bad_requests_are_not_filter_errors(self, mocker):
